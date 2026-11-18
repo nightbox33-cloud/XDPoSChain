@@ -1,0 +1,383 @@
+// Copyright 2021 The go-ethereum Authors
+// This file is part of the go-ethereum library.
+//
+// The go-ethereum library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The go-ethereum library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+
+package native
+
+import (
+	"encoding/json"
+	"errors"
+	"math/big"
+	"sync/atomic"
+
+	"github.com/XinFinOrg/XDPoSChain/accounts/abi"
+	"github.com/XinFinOrg/XDPoSChain/common"
+	"github.com/XinFinOrg/XDPoSChain/common/hexutil"
+	"github.com/XinFinOrg/XDPoSChain/core/tracing"
+	"github.com/XinFinOrg/XDPoSChain/core/types"
+	"github.com/XinFinOrg/XDPoSChain/core/vm"
+	"github.com/XinFinOrg/XDPoSChain/eth/tracers"
+	"github.com/XinFinOrg/XDPoSChain/params"
+)
+
+//go:generate go run github.com/fjl/gencodec -type callFrame -field-override callFrameMarshaling -out gen_callframe_json.go
+
+func init() {
+	tracers.DefaultDirectory.Register("callTracer", newCallTracer, false)
+}
+
+type callLog struct {
+	Address common.Address `json:"address"`
+	Topics  []common.Hash  `json:"topics"`
+	Data    hexutil.Bytes  `json:"data"`
+	Index   hexutil.Uint   `json:"index"`
+	// Position of the log relative to subcalls within the same trace
+	// See https://github.com/ethereum/go-ethereum/pull/28389 for details
+	Position hexutil.Uint `json:"position"`
+}
+
+type callFrame struct {
+	Type         vm.OpCode       `json:"-"`
+	From         common.Address  `json:"from"`
+	Gas          uint64          `json:"gas"`
+	GasUsed      uint64          `json:"gasUsed"`
+	To           *common.Address `json:"to,omitempty" rlp:"optional"`
+	Input        []byte          `json:"input" rlp:"optional"`
+	Output       []byte          `json:"output,omitempty" rlp:"optional"`
+	Error        string          `json:"error,omitempty" rlp:"optional"`
+	RevertReason string          `json:"revertReason,omitempty"`
+	Calls        []callFrame     `json:"calls,omitempty" rlp:"optional"`
+	Logs         []callLog       `json:"logs,omitempty" rlp:"optional"`
+	// Placed at end on purpose. The RLP will be decoded to 0 instead of
+	// nil if there are non-empty elements after in the struct.
+	Value            *big.Int `json:"value,omitempty" rlp:"optional"`
+	revertedSnapshot bool
+}
+
+func (f callFrame) TypeString() string {
+	return f.Type.String()
+}
+
+func (f callFrame) failed() bool {
+	return len(f.Error) > 0 && f.revertedSnapshot
+}
+
+func (f *callFrame) processOutput(output []byte, err error, reverted bool) {
+	output = common.CopyBytes(output)
+	// Clear error if tx wasn't reverted. This happened
+	// for pre-homestead contract storage OOG.
+	if err != nil && !reverted {
+		err = nil
+	}
+	if err == nil {
+		f.Output = output
+		return
+	}
+	f.Error = err.Error()
+	f.revertedSnapshot = reverted
+	if f.Type == vm.CREATE || f.Type == vm.CREATE2 {
+		f.To = nil
+	}
+	if !errors.Is(err, vm.ErrExecutionReverted) || len(output) == 0 {
+		return
+	}
+	f.Output = output
+	if len(output) < 4 {
+		return
+	}
+	if unpacked, err := abi.UnpackRevert(output); err == nil {
+		f.RevertReason = unpacked
+	}
+}
+
+type callFrameMarshaling struct {
+	TypeString string `json:"type"`
+	Gas        hexutil.Uint64
+	GasUsed    hexutil.Uint64
+	Value      *hexutil.Big
+	Input      hexutil.Bytes
+	Output     hexutil.Bytes
+}
+
+type callTracer struct {
+	callstack []callFrame
+	config    callTracerConfig
+	gasLimit  uint64
+	depth     int
+	interrupt atomic.Bool // Atomic flag to signal execution interruption
+	reason    error       // Textual reason for the interruption
+
+	// `isNonEVMTx` marks transactions that do not execute EVM opcodes and
+	// therefore require the tracer to return a synthetic top-level call
+	// frame instead of relying on the EVM callstack.
+	isNonEVMTx bool
+
+	// `nonEVMCall` holds the prepared virtual top-level callFrame for
+	// non-EVM special transactions. It is marshalled directly by
+	// `GetResult()` to preserve debug API compatibility.
+	nonEVMCall callFrame
+}
+
+type callTracerConfig struct {
+	OnlyTopCall bool `json:"onlyTopCall"` // If true, call tracer won't collect any subcalls
+	WithLog     bool `json:"withLog"`     // If true, call tracer will collect event logs
+}
+
+// newCallTracer returns a native go tracer which tracks
+// call frames of a tx, and implements vm.EVMLogger.
+func newCallTracer(ctx *tracers.Context, cfg json.RawMessage, chainConfig *params.ChainConfig) (*tracers.Tracer, error) {
+	t, err := newCallTracerObject(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &tracers.Tracer{
+		Hooks: &tracing.Hooks{
+			OnTxStart: t.OnTxStart,
+			OnTxEnd:   t.OnTxEnd,
+			OnEnter:   t.OnEnter,
+			OnExit:    t.OnExit,
+			OnLog:     t.OnLog,
+		},
+		GetResult: t.GetResult,
+		Stop:      t.Stop,
+	}, nil
+}
+
+func newCallTracerObject(ctx *tracers.Context, cfg json.RawMessage) (*callTracer, error) {
+	var config callTracerConfig
+	if err := json.Unmarshal(cfg, &config); err != nil {
+		return nil, err
+	}
+	// First callframe contains tx context info
+	// and is populated on start and end.
+	return &callTracer{callstack: make([]callFrame, 0, 1), config: config}, nil
+}
+
+// OnEnter is called when EVM enters a new scope (via call, create or selfdestruct).
+func (t *callTracer) OnEnter(depth int, typ byte, from common.Address, to common.Address, input []byte, gas uint64, value *big.Int) {
+	t.depth = depth
+	if t.config.OnlyTopCall && depth > 0 {
+		return
+	}
+	// Skip if tracing was interrupted
+	if t.interrupt.Load() {
+		return
+	}
+
+	toCopy := to
+	call := callFrame{
+		Type:  vm.OpCode(typ),
+		From:  from,
+		To:    &toCopy,
+		Input: common.CopyBytes(input),
+		Gas:   gas,
+		Value: value,
+	}
+	if depth == 0 {
+		call.Gas = t.gasLimit
+	}
+	t.callstack = append(t.callstack, call)
+}
+
+// OnExit is called when EVM exits a scope, even if the scope didn't
+// execute any code.
+func (t *callTracer) OnExit(depth int, output []byte, gasUsed uint64, err error, reverted bool) {
+	if depth == 0 {
+		t.captureEnd(output, gasUsed, err, reverted)
+		return
+	}
+
+	t.depth = depth - 1
+	if t.config.OnlyTopCall {
+		return
+	}
+
+	size := len(t.callstack)
+	if size <= 1 {
+		return
+	}
+	// Pop call.
+	call := t.callstack[size-1]
+	t.callstack = t.callstack[:size-1]
+	size -= 1
+
+	call.GasUsed = gasUsed
+	call.processOutput(output, err, reverted)
+	// Nest call into parent.
+	t.callstack[size-1].Calls = append(t.callstack[size-1].Calls, call)
+}
+
+// captureEnd is called after a transaction execution completes and processes
+// the final output for the top-level call frame. This method is only applicable
+// to normal EVM transactions where the callstack has exactly one frame. For
+// non-EVM special transactions, the callstack is empty and this becomes a no-op.
+func (t *callTracer) captureEnd(output []byte, gasUsed uint64, err error, reverted bool) {
+	if len(t.callstack) != 1 {
+		return
+	}
+	t.callstack[0].processOutput(output, err, reverted)
+}
+
+func (t *callTracer) OnTxStart(env *tracing.VMContext, tx *types.Transaction, from common.Address) {
+	// Reset any previous non-EVM call state to ensure tracer is clean
+	// for the new transaction, preventing state leakage between txs.
+	t.isNonEVMTx = false
+	t.nonEVMCall = callFrame{}
+	t.callstack = make([]callFrame, 0, 1)
+
+	if tx == nil {
+		return
+	}
+	t.gasLimit = tx.Gas()
+
+	// Detect non-EVM special transactions so GetResult can return a virtual
+	// top-level call when the EVM did not execute any opcodes for this tx.
+	if tx.IsNonEVMTx() {
+		t.isNonEVMTx = true
+		t.nonEVMCall.Type = vm.CALL // synthetic for compatibility
+		t.nonEVMCall.From = from
+		if to := tx.To(); to != nil {
+			addr := *to // intentional copy
+			t.nonEVMCall.To = &addr
+		}
+		t.nonEVMCall.Gas = tx.Gas()
+		t.nonEVMCall.Value = tx.Value()
+		t.nonEVMCall.GasUsed = 0
+		t.nonEVMCall.Input = common.CopyBytes(tx.Data())
+		// Non-EVM transactions don't produce output or errors
+		t.nonEVMCall.Output = nil
+		t.nonEVMCall.Error = ""
+		// Initialize to nil to avoid heap allocation for empty slices
+		t.nonEVMCall.Calls = nil
+		t.nonEVMCall.Logs = nil
+	}
+}
+
+func (t *callTracer) OnTxEnd(receipt *types.Receipt, err error) {
+	// Error happened during tx validation.
+	if err != nil {
+		return
+	}
+
+	// Transactions to the system addresses are flagged as non-EVM on OnTxStart, but the
+	// EVM only stays out of them while the fork that routes them away is active. When it
+	// did run, a real top-level frame exists and that is the one to update.
+	if len(t.callstack) == 0 {
+		// No frame was pushed: the EVM did not execute this transaction, so keep the
+		// synthetic frame in step with the receipt. Guard against an empty callstack to
+		// avoid panic.
+		if t.isNonEVMTx && receipt != nil {
+			t.nonEVMCall.GasUsed = receipt.GasUsed
+		}
+		return
+	}
+
+	if receipt != nil {
+		t.callstack[0].GasUsed = receipt.GasUsed
+	}
+	if t.config.WithLog {
+		// Logs are not emitted when the call fails
+		clearFailedLogs(&t.callstack[0], false)
+	}
+}
+
+func (t *callTracer) OnLog(log *types.Log) {
+	// Only logs need to be captured via opcode processing
+	if !t.config.WithLog {
+		return
+	}
+	// Avoid processing nested calls when only caring about top call
+	if t.config.OnlyTopCall && t.depth > 0 {
+		return
+	}
+	// Skip if tracing was interrupted
+	if t.interrupt.Load() {
+		return
+	}
+	// The synthetic frame only collects the logs of a transaction the EVM did not
+	// execute. When the EVM ran, the logs belong to the real top-level frame below.
+	if t.isNonEVMTx && len(t.callstack) == 0 {
+		l := callLog{
+			Address:  log.Address,
+			Topics:   log.Topics,
+			Data:     log.Data,
+			Position: hexutil.Uint(len(t.nonEVMCall.Calls)),
+		}
+		t.nonEVMCall.Logs = append(t.nonEVMCall.Logs, l)
+		return
+	}
+	// Skip if callstack is empty
+	if len(t.callstack) == 0 {
+		return
+	}
+	// Cache the index of the current frame to avoid repeated calculations
+	lastIdx := len(t.callstack) - 1
+	l := callLog{
+		Address:  log.Address,
+		Topics:   log.Topics,
+		Data:     log.Data,
+		Index:    hexutil.Uint(log.Index),
+		Position: hexutil.Uint(len(t.callstack[lastIdx].Calls)),
+	}
+	t.callstack[lastIdx].Logs = append(t.callstack[lastIdx].Logs, l)
+}
+
+// GetResult returns the json-encoded nested list of call traces, and any
+// error arising from the encoding or forceful termination (via `Stop`).
+// For non-EVM transactions, a synthetic virtual frame is returned to maintain
+// debug API compatibility even though the EVM did not execute opcodes.
+func (t *callTracer) GetResult() (json.RawMessage, error) {
+	// A real top-level frame wins whenever the EVM executed the transaction, even if
+	// its to address flags it as non-EVM: transactions to the system addresses only
+	// stay out of the EVM while the fork that routes them away is active. The synthetic
+	// frame prepared on OnTxStart is the fallback for the transactions the EVM never
+	// entered; it is returned directly without mutating the tracer state.
+	if len(t.callstack) == 0 && t.isNonEVMTx {
+		res, err := json.Marshal(t.nonEVMCall)
+		if err != nil {
+			return nil, err
+		}
+		return res, t.reason
+	}
+
+	if len(t.callstack) != 1 {
+		return nil, errors.New("incorrect number of top-level calls")
+	}
+
+	res, err := json.Marshal(t.callstack[0])
+	if err != nil {
+		return nil, err
+	}
+	return res, t.reason
+}
+
+// Stop terminates execution of the tracer at the first opportune moment.
+func (t *callTracer) Stop(err error) {
+	t.reason = err
+	t.interrupt.Store(true)
+}
+
+// clearFailedLogs clears the logs of a callframe and all its children
+// in case of execution failure.
+func clearFailedLogs(cf *callFrame, parentFailed bool) {
+	failed := cf.failed() || parentFailed
+	// Clear own logs
+	if failed {
+		cf.Logs = nil
+	}
+	for i := range cf.Calls {
+		clearFailedLogs(&cf.Calls[i], failed)
+	}
+}

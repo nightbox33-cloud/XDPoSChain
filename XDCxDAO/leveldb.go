@@ -1,0 +1,128 @@
+package XDCxDAO
+
+import (
+	"bytes"
+	"errors"
+
+	"github.com/XinFinOrg/XDPoSChain/core/rawdb"
+	"github.com/XinFinOrg/XDPoSChain/ethdb"
+	"github.com/XinFinOrg/XDPoSChain/log"
+)
+
+type BatchItem struct {
+	Value interface{}
+}
+
+type BatchDatabase struct {
+	db         ethdb.Database
+	emptyKey   []byte
+	cacheLimit int
+	Debug      bool
+}
+
+// NewBatchDatabase use rlp as encoding
+func NewBatchDatabase(datadir string, cacheLimit int) *BatchDatabase {
+	return NewBatchDatabaseWithEncode(datadir, cacheLimit)
+}
+
+// batchdatabase is a fast cache db to retrieve in-mem object
+func NewBatchDatabaseWithEncode(datadir string, cacheLimit int) *BatchDatabase {
+	db, err := rawdb.NewLevelDBDatabase(datadir, 128, 1024, "", false)
+	if err != nil {
+		log.Error("Can't create new DB", "error", err)
+		return nil
+	}
+	itemCacheLimit := defaultCacheLimit
+	if cacheLimit > 0 {
+		itemCacheLimit = cacheLimit
+	}
+
+	batchDB := &BatchDatabase{
+		db:         db,
+		emptyKey:   EmptyKey(), // pre alloc for comparison
+		cacheLimit: itemCacheLimit,
+	}
+
+	return batchDB
+}
+
+func (db *BatchDatabase) IsEmptyKey(key []byte) bool {
+	return len(key) == 0 || bytes.Equal(key, db.emptyKey)
+}
+
+func (db *BatchDatabase) Put(key []byte, val []byte) error {
+	return db.db.Put(key, val)
+}
+
+func (db *BatchDatabase) Delete(key []byte) error {
+	return db.db.Delete(key)
+}
+
+func (db *BatchDatabase) Has(key []byte) (bool, error) {
+	return db.db.Has(key)
+}
+
+func (db *BatchDatabase) Get(key []byte) ([]byte, error) {
+	return db.db.Get(key)
+}
+
+func (db *BatchDatabase) Close() error {
+	return db.db.Close()
+}
+
+func (db *BatchDatabase) NewBatch() ethdb.Batch {
+	return db.db.NewBatch()
+}
+
+func (db *BatchDatabase) NewBatchWithSize(size int) ethdb.Batch {
+	return db.db.NewBatch()
+}
+
+var errNotSupported = errors.New("this operation is not supported")
+
+// HasAncient returns an error as we don't have a backing chain freezer.
+func (db *BatchDatabase) HasAncient(kind string, number uint64) (bool, error) {
+	return false, errNotSupported
+}
+
+// Ancient returns an error as we don't have a backing chain freezer.
+func (db *BatchDatabase) Ancient(kind string, number uint64) ([]byte, error) {
+	return nil, errNotSupported
+}
+
+// Ancients returns an error as we don't have a backing chain freezer.
+func (db *BatchDatabase) Ancients() (uint64, error) {
+	return 0, errNotSupported
+}
+
+// AncientSize returns an error as we don't have a backing chain freezer.
+func (db *BatchDatabase) AncientSize(kind string) (uint64, error) {
+	return 0, errNotSupported
+}
+
+// AppendAncient returns an error as we don't have a backing chain freezer.
+func (db *BatchDatabase) AppendAncient(number uint64, hash, header, body, receipts, td []byte) error {
+	return errNotSupported
+}
+
+// TruncateAncients returns an error as we don't have a backing chain freezer.
+func (db *BatchDatabase) TruncateAncients(items uint64) error {
+	return errNotSupported
+}
+
+// Sync returns an error as we don't have a backing chain freezer.
+func (db *BatchDatabase) Sync() error {
+	return errNotSupported
+}
+
+func (db *BatchDatabase) NewIterator(prefix []byte, start []byte) ethdb.Iterator {
+	panic("NewIterator from XDCxDAO leveldb is not supported")
+}
+
+func (db *BatchDatabase) Stat(property string) (string, error) {
+	return "", errNotSupported
+}
+
+func (db *BatchDatabase) Compact(start []byte, limit []byte) error {
+	return errNotSupported
+}

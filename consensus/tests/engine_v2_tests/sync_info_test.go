@@ -1,0 +1,356 @@
+package engine_v2_tests
+
+import (
+	"fmt"
+	"math/big"
+	"testing"
+
+	"github.com/XinFinOrg/XDPoSChain/common"
+	"github.com/XinFinOrg/XDPoSChain/consensus/XDPoS"
+	"github.com/XinFinOrg/XDPoSChain/consensus/XDPoS/utils"
+	"github.com/XinFinOrg/XDPoSChain/core/types"
+	"github.com/XinFinOrg/XDPoSChain/params"
+	"github.com/stretchr/testify/assert"
+)
+
+func TestSyncInfoShouldSuccessfullyUpdateByQC(t *testing.T) {
+	// Block 901 is the first v2 block with starting round of 0
+	blockchain, _, currentBlock, _, _, _ := PrepareXDCTestBlockChainForV2Engine(t, 905, params.TestXDPoSMockChainConfig, nil)
+	engineV2 := blockchain.Engine().(*XDPoS.XDPoS).EngineV2
+
+	var extraField types.ExtraFields_v2
+	err := utils.DecodeBytesExtraFields(currentBlock.Extra(), &extraField)
+	if err != nil {
+		t.Fatal("Fail to decode extra data", err)
+	}
+
+	syncInfoMsg := &types.SyncInfo{
+		HighestQuorumCert: extraField.QuorumCert,
+		HighestTimeoutCert: &types.TimeoutCert{
+			Round:      types.Round(2),
+			Signatures: []types.Signature{},
+		},
+	}
+
+	err = engineV2.SyncInfoHandler(blockchain, syncInfoMsg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	round, _, highestQuorumCert, _, _, highestCommitBlock := engineV2.GetPropertiesFaker()
+	// QC is parent block's qc, which is pointing at round 4, hence 4 + 1 = 5
+	assert.Equal(t, types.Round(5), round)
+	assert.Equal(t, extraField.QuorumCert, highestQuorumCert)
+	assert.Equal(t, types.Round(2), highestCommitBlock.Round)
+	assert.Equal(t, big.NewInt(902), highestCommitBlock.Number)
+}
+
+func TestSyncInfoShouldSuccessfullyUpdateByTC(t *testing.T) {
+	// Block 901 is the first v2 block with starting round of 0
+	blockchain, _, currentBlock, _, _, _ := PrepareXDCTestBlockChainForV2Engine(t, 905, params.TestXDPoSMockChainConfig, nil)
+	engineV2 := blockchain.Engine().(*XDPoS.XDPoS).EngineV2
+
+	var extraField types.ExtraFields_v2
+	err := utils.DecodeBytesExtraFields(currentBlock.Extra(), &extraField)
+	if err != nil {
+		t.Fatal("Fail to decode extra data", err)
+	}
+
+	highestTC := &types.TimeoutCert{
+		Round:      types.Round(6),
+		Signatures: []types.Signature{},
+	}
+
+	syncInfoMsg := &types.SyncInfo{
+		HighestQuorumCert:  extraField.QuorumCert,
+		HighestTimeoutCert: highestTC,
+	}
+
+	err = engineV2.SyncInfoHandler(blockchain, syncInfoMsg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	round, _, highestQuorumCert, _, _, _ := engineV2.GetPropertiesFaker()
+	assert.Equal(t, types.Round(7), round)
+	assert.Equal(t, extraField.QuorumCert, highestQuorumCert)
+}
+
+func TestSkipVerifySyncInfoIfBothQcTcNotQualified(t *testing.T) {
+	blockchain, _, _, _, _, _ := PrepareXDCTestBlockChainForV2Engine(t, 905, params.TestXDPoSMockChainConfig, nil)
+	engineV2 := blockchain.Engine().(*XDPoS.XDPoS).EngineV2
+
+	// Make the Highest QC in syncInfo point to an old block to simulate it's no longer qualified
+	parentBlock := blockchain.GetBlockByNumber(903)
+	var extraField types.ExtraFields_v2
+	err := utils.DecodeBytesExtraFields(parentBlock.Extra(), &extraField)
+	if err != nil {
+		t.Fatal("Fail to decode extra data", err)
+	}
+
+	highestTC := &types.TimeoutCert{
+		Round:      types.Round(5),
+		Signatures: []types.Signature{},
+	}
+
+	syncInfoMsg := &types.SyncInfo{
+		HighestQuorumCert:  extraField.QuorumCert,
+		HighestTimeoutCert: highestTC,
+	}
+
+	engineV2.SetPropertiesFaker(syncInfoMsg.HighestQuorumCert, syncInfoMsg.HighestTimeoutCert)
+
+	verified, err := engineV2.VerifySyncInfoMessage(blockchain, syncInfoMsg)
+	assert.False(t, verified)
+	assert.Nil(t, err)
+}
+
+// A node that has never formed a TC holds the bootstrap TC (round 0, no signatures) and
+// puts it into every syncInfo it sends. The QC in such a message is the only way for a
+// node that missed a QC to catch up, so the placeholder TC must not invalidate it.
+func TestVerifySyncInfoWithNewerQCAndBootstrapTC(t *testing.T) {
+	blockchain, _, currentBlock, _, _, _ := PrepareXDCTestBlockChainForV2Engine(t, 905, params.TestXDPoSMockChainConfig, nil)
+	engineV2 := blockchain.Engine().(*XDPoS.XDPoS).EngineV2
+
+	// The incoming syncInfo carries the newer QC, taken from the chain head.
+	var incoming types.ExtraFields_v2
+	if err := utils.DecodeBytesExtraFields(currentBlock.Extra(), &incoming); err != nil {
+		t.Fatal("Fail to decode extra data", err)
+	}
+
+	// Our node sits on an older QC and has never seen a TC, exactly like a node whose
+	// votes fell short of the threshold at network start.
+	var older types.ExtraFields_v2
+	if err := utils.DecodeBytesExtraFields(blockchain.GetBlockByNumber(903).Extra(), &older); err != nil {
+		t.Fatal("Fail to decode extra data", err)
+	}
+	bootstrapTC := &types.TimeoutCert{
+		Round:      types.Round(0),
+		Signatures: []types.Signature{},
+	}
+	engineV2.SetPropertiesFaker(older.QuorumCert, bootstrapTC)
+
+	syncInfoMsg := &types.SyncInfo{
+		HighestQuorumCert:  incoming.QuorumCert,
+		HighestTimeoutCert: bootstrapTC,
+	}
+
+	verified, err := engineV2.VerifySyncInfoMessage(blockchain, syncInfoMsg)
+	assert.Nil(t, err, "the bootstrap TC must not invalidate a syncInfo whose QC is newer and valid")
+	assert.True(t, verified)
+}
+
+// The exemption is deliberately narrow: it covers only the empty placeholder, and any TC
+// that actually carries signatures is still put through verifyTC in full. This pins that
+// boundary, so the exemption cannot be widened by sending a TC with a bogus signature set.
+//
+// The trade-off it also documents: a TC that would never be processed anyway - here one
+// staler than the one we hold - still invalidates the whole message, discarding a QC we do
+// need. Verifying only the certificate that is ahead of ours would avoid that, at the cost
+// of a broader change to the syncInfo path.
+func TestVerifySyncInfoStillVerifiesNonEmptyTC(t *testing.T) {
+	blockchain, _, currentBlock, _, _, _ := PrepareXDCTestBlockChainForV2Engine(t, 905, params.TestXDPoSMockChainConfig, nil)
+	engineV2 := blockchain.Engine().(*XDPoS.XDPoS).EngineV2
+
+	var incoming types.ExtraFields_v2
+	if err := utils.DecodeBytesExtraFields(currentBlock.Extra(), &incoming); err != nil {
+		t.Fatal("Fail to decode extra data", err)
+	}
+	var older types.ExtraFields_v2
+	if err := utils.DecodeBytesExtraFields(blockchain.GetBlockByNumber(903).Extra(), &older); err != nil {
+		t.Fatal("Fail to decode extra data", err)
+	}
+
+	// We already hold a newer TC than the one being sent to us.
+	ourTC := &types.TimeoutCert{
+		Round:      types.Round(5),
+		Signatures: []types.Signature{},
+	}
+	engineV2.SetPropertiesFaker(older.QuorumCert, ourTC)
+
+	// Their TC carries a signature, so it is not the placeholder and gets verified: round 1
+	// with gap number 0, which has no snapshot here, so verification fails.
+	staleTC := &types.TimeoutCert{
+		Round:      types.Round(1),
+		Signatures: []types.Signature{SignHashByPK(acc1Key, types.TimeoutSigHash(&types.TimeoutForSign{Round: types.Round(1), GapNumber: 0}).Bytes())},
+		GapNumber:  0,
+	}
+
+	syncInfoMsg := &types.SyncInfo{
+		HighestQuorumCert:  incoming.QuorumCert,
+		HighestTimeoutCert: staleTC,
+	}
+
+	verified, err := engineV2.VerifySyncInfoMessage(blockchain, syncInfoMsg)
+	assert.NotNil(t, err, "a TC carrying signatures must still be verified, not exempted")
+	assert.False(t, verified)
+}
+
+func TestVerifySyncInfoIfTCRoundIsAtNextEpoch(t *testing.T) {
+	blockchain, _, _, _, _, _ := PrepareXDCTestBlockChainForV2Engine(t, 905, params.TestXDPoSMockChainConfig, nil)
+	engineV2 := blockchain.Engine().(*XDPoS.XDPoS).EngineV2
+
+	// Make the Highest QC in syncInfo point to an old block to simulate it's no longer qualified
+	parentBlock := blockchain.GetBlockByNumber(903)
+	var extraField types.ExtraFields_v2
+	err := utils.DecodeBytesExtraFields(parentBlock.Extra(), &extraField)
+	if err != nil {
+		t.Fatal("Fail to decode extra data", err)
+	}
+
+	highestTC := &types.TimeoutCert{
+		Round:      types.Round(899),
+		Signatures: []types.Signature{},
+	}
+
+	timeoutForSign := &types.TimeoutForSign{
+		Round:     types.Round(900),
+		GapNumber: 450,
+	}
+
+	// Sign from acc 1, 2, 3 and voter
+	acc1SignedHash := SignHashByPK(acc1Key, types.TimeoutSigHash(timeoutForSign).Bytes())
+	acc2SignedHash := SignHashByPK(acc2Key, types.TimeoutSigHash(timeoutForSign).Bytes())
+	acc3SignedHash := SignHashByPK(acc3Key, types.TimeoutSigHash(timeoutForSign).Bytes())
+	voterSignedHash := SignHashByPK(voterKey, types.TimeoutSigHash(timeoutForSign).Bytes())
+
+	var signatures []types.Signature
+	signatures = append(signatures, acc1SignedHash, acc2SignedHash, acc3SignedHash, voterSignedHash)
+
+	syncInfoTC := &types.TimeoutCert{
+		Round:      timeoutForSign.Round,
+		Signatures: signatures,
+		GapNumber:  timeoutForSign.GapNumber,
+	}
+
+	syncInfoMsg := &types.SyncInfo{
+		HighestQuorumCert:  extraField.QuorumCert,
+		HighestTimeoutCert: syncInfoTC,
+	}
+
+	engineV2.SetPropertiesFaker(syncInfoMsg.HighestQuorumCert, highestTC)
+
+	verified, err := engineV2.VerifySyncInfoMessage(blockchain, syncInfoMsg)
+	assert.True(t, verified)
+	assert.Nil(t, err)
+}
+
+func TestVerifySyncInfoIfTcUseDifferentEpoch(t *testing.T) {
+	skipLongInShortMode(t)
+	config := params.TestXDPoSMockChainConfig
+	blockchain, _, currentBlock, signer, signFn, _ := PrepareXDCTestBlockChainForV2Engine(t, 1349, config, nil)
+	adaptor := blockchain.Engine().(*XDPoS.XDPoS)
+	x := adaptor.EngineV2
+
+	// Insert block 1350
+	t.Logf("Inserting block with propose at 1350...")
+	blockCoinbaseA := "0xaaa0000000000000000000000000000000001350"
+	// NOTE: voterAddr never exist in the Masternode list, but all acc1,2,3 already does
+	tx, err := voteTX(37117, 0, signer.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	//Get from block validator error message
+	merkleRoot := "8a355a8636d1aae24d5a63df0318534e09110891d6ab7bf20587da64725083be"
+	header := &types.Header{
+		Root:       common.HexToHash(merkleRoot),
+		Number:     big.NewInt(int64(1350)),
+		ParentHash: currentBlock.Hash(),
+		Coinbase:   common.HexToAddress(blockCoinbaseA),
+	}
+
+	header.Extra = generateV2Extra(450, currentBlock, signer, signFn, nil)
+
+	parentBlock, err := createBlockFromHeader(blockchain, header, []*types.Transaction{tx}, signer, signFn, config)
+	assert.Nil(t, err)
+	err = blockchain.InsertBlock(parentBlock)
+	assert.Nil(t, err)
+	t.Logf("Inserting block from 1351 to 1799...")
+	for i := 1351; i <= 1799; i++ {
+		blockCoinbase := fmt.Sprintf("0xaaa000000000000000000000000000000000%4d", i)
+		//Get from block validator error message
+		header = &types.Header{
+			Root:       common.HexToHash(merkleRoot),
+			Number:     big.NewInt(int64(i)),
+			ParentHash: parentBlock.Hash(),
+			Coinbase:   common.HexToAddress(blockCoinbase),
+		}
+
+		header.Extra = generateV2Extra(int64(i)-900, parentBlock, signer, signFn, nil)
+
+		block, err := createBlockFromHeader(blockchain, header, nil, signer, signFn, config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = blockchain.InsertBlock(block)
+		assert.Nil(t, err)
+		parentBlock = block
+	}
+	t.Logf("build epoch block with new set of masternodes")
+	blockCoinbase := fmt.Sprintf("0xaaa0000000000000000000000000000000001800")
+	//Get from block validator error message
+	header = &types.Header{
+		Root:       common.HexToHash(merkleRoot),
+		Number:     big.NewInt(int64(1800)),
+		ParentHash: parentBlock.Hash(),
+		Coinbase:   common.HexToAddress(blockCoinbase),
+	}
+
+	header.Extra = generateV2Extra(900, parentBlock, signer, signFn, nil)
+	validators := []byte{}
+
+	snap, err := x.GetSnapshot(blockchain, parentBlock.Header())
+	assert.Nil(t, err)
+
+	for _, v := range snap.NextEpochCandidates {
+		validators = append(validators, v[:]...)
+	}
+	// set up 1 more masternode to make it difference
+	validators = append(validators, voterAddr[:]...)
+	header.Validators = validators
+	block, err := createBlockFromHeader(blockchain, header, nil, signer, signFn, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = blockchain.InsertBlock(block)
+	assert.Nil(t, err)
+	parentBlock = block
+
+	var extraField types.ExtraFields_v2
+	err = utils.DecodeBytesExtraFields(parentBlock.Extra(), &extraField)
+	if err != nil {
+		t.Fatal("Fail to decode extra data", err)
+	}
+
+	timeoutForSign := &types.TimeoutForSign{
+		Round:     types.Round(899),
+		GapNumber: 450,
+	}
+
+	// Sign from acc 1, 2, 3 and voter
+	acc1SignedHash := SignHashByPK(acc1Key, types.TimeoutSigHash(timeoutForSign).Bytes())
+	acc2SignedHash := SignHashByPK(acc2Key, types.TimeoutSigHash(timeoutForSign).Bytes())
+	acc3SignedHash := SignHashByPK(acc3Key, types.TimeoutSigHash(timeoutForSign).Bytes())
+	voterSignedHash := SignHashByPK(voterKey, types.TimeoutSigHash(timeoutForSign).Bytes())
+
+	var signatures []types.Signature
+	signatures = append(signatures, acc1SignedHash, acc2SignedHash, acc3SignedHash, voterSignedHash)
+
+	newTC := &types.TimeoutCert{
+		Round:      timeoutForSign.Round,
+		Signatures: signatures,
+		GapNumber:  timeoutForSign.GapNumber,
+	}
+
+	syncInfoMsg := &types.SyncInfo{
+		HighestQuorumCert:  extraField.QuorumCert,
+		HighestTimeoutCert: newTC,
+	}
+
+	x.SetPropertiesFaker(syncInfoMsg.HighestQuorumCert, &types.TimeoutCert{
+		Round:      types.Round(898),
+		Signatures: []types.Signature{},
+	})
+
+	verified, err := x.VerifySyncInfoMessage(blockchain, syncInfoMsg)
+	assert.True(t, verified)
+	assert.Nil(t, err)
+}

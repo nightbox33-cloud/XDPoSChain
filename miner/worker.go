@@ -1,0 +1,1347 @@
+// Copyright 2015 The go-ethereum Authors
+// This file is part of the go-ethereum library.
+//
+// The go-ethereum library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The go-ethereum library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+
+package miner
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"math/big"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/XinFinOrg/XDPoSChain/XDCx/tradingstate"
+	"github.com/XinFinOrg/XDPoSChain/XDCxlending/lendingstate"
+	"github.com/XinFinOrg/XDPoSChain/accounts"
+	"github.com/XinFinOrg/XDPoSChain/common"
+	"github.com/XinFinOrg/XDPoSChain/consensus"
+	"github.com/XinFinOrg/XDPoSChain/consensus/XDPoS"
+	"github.com/XinFinOrg/XDPoSChain/consensus/misc"
+	"github.com/XinFinOrg/XDPoSChain/consensus/misc/eip1559"
+	"github.com/XinFinOrg/XDPoSChain/contracts"
+	"github.com/XinFinOrg/XDPoSChain/core"
+	"github.com/XinFinOrg/XDPoSChain/core/state"
+	"github.com/XinFinOrg/XDPoSChain/core/txpool"
+	"github.com/XinFinOrg/XDPoSChain/core/types"
+	"github.com/XinFinOrg/XDPoSChain/core/vm"
+	"github.com/XinFinOrg/XDPoSChain/ethdb"
+	"github.com/XinFinOrg/XDPoSChain/event"
+	"github.com/XinFinOrg/XDPoSChain/log"
+	"github.com/XinFinOrg/XDPoSChain/metrics"
+	"github.com/XinFinOrg/XDPoSChain/params"
+	"github.com/XinFinOrg/XDPoSChain/trie"
+	mapset "github.com/deckarep/golang-set/v2"
+	"github.com/holiman/uint256"
+)
+
+const (
+	resultQueueSize  = 10
+	miningLogAtDepth = 5
+
+	// txChanSize is the size of channel listening to NewTxsEvent.
+	// The number is referenced from the size of tx pool.
+	txChanSize = 4096
+	// chainHeadChanSize is the size of channel listening to ChainHeadEvent.
+	chainHeadChanSize = 10
+	// chainSideChanSize is the size of channel listening to ChainSideEvent.
+	chainSideChanSize = 10
+
+	txMatchGasLimit = 40000000
+
+	// Block size is capped by the protocol at params.MaxBlockSize. During
+	// production keep a safety margin for auxiliary fields added to the block.
+	maxBlockSizeBufferZone = 1_000_000
+)
+
+var (
+	blockNumberGauge   = metrics.NewRegisteredGauge("miner/number", nil)
+	normalTxsMeter     = metrics.NewRegisteredGauge("miner/txs/normal", nil)
+	specialTxsMeter    = metrics.NewRegisteredGauge("miner/txs/special", nil)
+	blockCommitTimer   = metrics.NewRegisteredTimer("miner/time/commit", nil)
+	blockFinalizeTimer = metrics.NewRegisteredTimer("miner/time/finalize", nil)
+	blockTotalTimer    = metrics.NewRegisteredTimer("miner/time/total", nil)
+	maxGasTip          = big.NewInt(50_000 * params.GWei)
+)
+
+// Agent can register themself with the worker
+type Agent interface {
+	Work() chan<- *Work
+	SetReturnCh(chan<- *Result)
+	Stop()
+	Start()
+	GetHashRate() int64
+}
+
+// Work is the workers current environment and holds
+// all of the current state information
+type Work struct {
+	config *params.ChainConfig
+	signer types.Signer
+	state  *state.StateDB // apply state changes here
+	tcount int            // tx count in cycle
+	size   uint64         // size of the block we are building
+	evm    *vm.EVM
+
+	parentState  *state.StateDB
+	tradingState *tradingstate.TradingStateDB
+	lendingState *lendingstate.LendingStateDB
+	ancestors    mapset.Set[common.Hash] // ancestor set (used for checking uncle parent validity)
+	family       mapset.Set[common.Hash] // family set (used for checking uncle invalidity)
+
+	Block *types.Block // the new block
+
+	header   *types.Header
+	txs      []*types.Transaction
+	receipts []*types.Receipt
+	uncles   map[common.Hash]*types.Header
+
+	createdAt time.Time
+}
+
+// txFitsSize reports whether the transaction fits into the block size limit.
+func (w *Work) txFitsSize(tx *types.Transaction) bool {
+	// this Osaka-specific cap is not enforced pre-fork
+	if w.config.IsOsaka(w.header.Number) {
+		return w.size+tx.Size() < params.MaxBlockSize-maxBlockSizeBufferZone
+	}
+	return true
+}
+
+type Result struct {
+	Work  *Work
+	Block *types.Block
+}
+
+// worker is the main object which takes care of applying messages to the new state
+type worker struct {
+	config      *Config
+	chainConfig *params.ChainConfig
+	engine      consensus.Engine
+
+	// Feeds
+	pendingLogsFeed event.Feed
+
+	// update loop
+	mux          *event.TypeMux
+	txsCh        chan core.NewTxsEvent
+	txsSub       event.Subscription
+	chainHeadCh  chan core.ChainHeadEvent
+	chainHeadSub event.Subscription
+	chainSideCh  chan core.ChainSideEvent
+	chainSideSub event.Subscription
+
+	wg sync.WaitGroup
+
+	agents map[Agent]struct{}
+	recv   chan *Result
+
+	eth     Backend
+	chain   *core.BlockChain
+	proc    core.Validator
+	chainDb ethdb.Database
+
+	mu       sync.Mutex
+	coinbase common.Address
+	extra    []byte
+	tip      *uint256.Int // Configured minimum gas-price threshold for including transactions in mined blocks.
+
+	snapshotMu       sync.RWMutex // The lock used to protect the block snapshot and state snapshot
+	snapshotBlock    *types.Block
+	snapshotReceipts types.Receipts
+	snapshotState    *state.StateDB
+
+	currentMu sync.Mutex
+	current   *Work
+
+	uncleMu        sync.Mutex
+	possibleUncles map[common.Hash]*types.Block
+
+	unconfirmed *unconfirmedBlocks // set of locally mined blocks pending canonicalness confirmations
+
+	// atomic status counters
+	mining                int32
+	atWork                int32
+	announceTxs           bool
+	lastParentBlockCommit string
+}
+
+func newWorker(config *Config, chainConfig *params.ChainConfig, engine consensus.Engine, eth Backend, mux *event.TypeMux, announceTxs bool) *worker {
+	worker := &worker{
+		config:         config,
+		chainConfig:    chainConfig,
+		engine:         engine,
+		eth:            eth,
+		mux:            mux,
+		coinbase:       config.Etherbase,
+		extra:          config.ExtraData,
+		tip:            uint256.MustFromBig(config.GasPrice),
+		txsCh:          make(chan core.NewTxsEvent, txChanSize),
+		chainHeadCh:    make(chan core.ChainHeadEvent, chainHeadChanSize),
+		chainSideCh:    make(chan core.ChainSideEvent, chainSideChanSize),
+		chainDb:        eth.ChainDb(),
+		recv:           make(chan *Result, resultQueueSize),
+		chain:          eth.BlockChain(),
+		proc:           eth.BlockChain().Validator(),
+		possibleUncles: make(map[common.Hash]*types.Block),
+		agents:         make(map[Agent]struct{}),
+		unconfirmed:    newUnconfirmedBlocks(eth.BlockChain(), miningLogAtDepth),
+		announceTxs:    announceTxs,
+	}
+	if worker.announceTxs {
+		// Subscribe NewTxsEvent for tx pool
+		worker.txsSub = eth.TxPool().SubscribeTransactions(worker.txsCh, true)
+	}
+	// Subscribe events for blockchain
+	worker.chainHeadSub = eth.BlockChain().SubscribeChainHeadEvent(worker.chainHeadCh)
+	worker.chainSideSub = eth.BlockChain().SubscribeChainSideEvent(worker.chainSideCh)
+	go worker.update()
+
+	go worker.wait()
+	worker.commitNewWork()
+
+	return worker
+}
+
+func (w *worker) setEtherbase(addr common.Address) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.coinbase = addr
+}
+
+func (w *worker) setExtra(extra []byte) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.extra = extra
+}
+
+// setGasTip sets the minimum miner tip needed to include a non-local transaction.
+func (w *worker) setGasTip(tip *big.Int) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if tip == nil {
+		return errors.New("reject nil gas tip")
+	}
+	if tip.Sign() < 0 {
+		return fmt.Errorf("reject negative gas tip: %v", tip)
+	}
+	if tip.Cmp(maxGasTip) > 0 {
+		return fmt.Errorf("reject too high gas tip: %v, maximum: %v", tip, maxGasTip)
+	}
+
+	// Copy the value to avoid external mutation through shared pointers.
+	w.tip = uint256.MustFromBig(tip)
+	log.Info("Worker tip updated", "tip", w.tip)
+	return nil
+}
+
+// pending returns the pending state and corresponding block. The returned
+// values can be nil in case the pending block is not initialized.
+func (w *worker) pending() (*types.Block, *state.StateDB) {
+	w.snapshotMu.RLock()
+	defer w.snapshotMu.RUnlock()
+	if w.snapshotState == nil {
+		return nil, nil
+	}
+	return w.snapshotBlock, w.snapshotState.Copy()
+}
+
+// pendingBlock returns pending block. The returned block can be nil in case the
+// pending block is not initialized.
+func (w *worker) pendingBlock() *types.Block {
+	w.snapshotMu.RLock()
+	defer w.snapshotMu.RUnlock()
+	return w.snapshotBlock
+}
+
+// pendingMinTipForHeader converts the configured minimum gas price into the
+// minimum tip required by txpool pending filtering for the given header.
+//
+// With base fee enabled, txpool filters by effective tip, not effective gas
+// price. To preserve the configured minimum gas price semantics, we derive:
+//
+//	minTip = max(minGasPrice - baseFee, 0)
+func pendingMinTipForHeader(minGasPrice *uint256.Int, baseFee *uint256.Int) *uint256.Int {
+	minTip := new(uint256.Int)
+	if minGasPrice != nil {
+		minTip.Set(minGasPrice)
+	}
+	if baseFee == nil {
+		return minTip
+	}
+	if minTip.Cmp(baseFee) <= 0 {
+		minTip.SetUint64(0)
+		return minTip
+	}
+	return minTip.Sub(minTip, baseFee)
+}
+
+// pendingFilterForHeader builds a txpool pending filter using the miner min
+// gas price semantics for the provided header.
+func pendingFilterForHeader(minGasPrice *uint256.Int, header *types.Header, chainConfig *params.ChainConfig) txpool.PendingFilter {
+	var baseFee *uint256.Int
+	if header.BaseFee != nil {
+		baseFee = uint256.MustFromBig(header.BaseFee)
+	}
+	filter := txpool.PendingFilter{
+		MinTip: pendingMinTipForHeader(minGasPrice, baseFee),
+	}
+	if baseFee != nil {
+		filter.BaseFee = baseFee
+	}
+	if chainConfig.IsOsaka(header.Number) {
+		filter.GasLimitCap = params.MaxTxGas
+	}
+	return filter
+}
+
+// pendingBlockAndReceipts returns pending block and corresponding receipts.
+func (w *worker) pendingBlockAndReceipts() (*types.Block, types.Receipts) {
+	// return a snapshot to avoid contention on currentMu mutex
+	w.snapshotMu.RLock()
+	defer w.snapshotMu.RUnlock()
+	return w.snapshotBlock, w.snapshotReceipts
+}
+
+func (w *worker) start() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	atomic.StoreInt32(&w.mining, 1)
+
+	// spin up agents
+	for agent := range w.agents {
+		agent.Start()
+	}
+
+	// Verify config and engine
+	var xdposEngine *XDPoS.XDPoS
+	if engine, ok := w.engine.(*XDPoS.XDPoS); ok {
+		xdposEngine = engine
+	}
+	if w.chainConfig != nil && w.chainConfig.XDPoS != nil && xdposEngine == nil {
+		log.Warn("XDPoS config enabled but consensus engine is not XDPoS")
+	}
+}
+
+func (w *worker) stop() {
+	w.wg.Wait()
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if atomic.LoadInt32(&w.mining) == 1 {
+		for agent := range w.agents {
+			agent.Stop()
+		}
+	}
+	atomic.StoreInt32(&w.mining, 0)
+	atomic.StoreInt32(&w.atWork, 0)
+}
+
+func (w *worker) register(agent Agent) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.agents[agent] = struct{}{}
+	agent.SetReturnCh(w.recv)
+}
+
+func (w *worker) unregister(agent Agent) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	delete(w.agents, agent)
+	agent.Stop()
+}
+
+func (w *worker) update() {
+	if w.announceTxs {
+		defer w.txsSub.Unsubscribe()
+	}
+	defer w.chainHeadSub.Unsubscribe()
+	defer w.chainSideSub.Unsubscribe()
+
+	// timeout waiting for v1 initial value
+	minePeriod := 2
+	var minePeriodCh <-chan int
+	var newRoundCh <-chan types.Round
+	if xdposEngine, ok := w.engine.(*XDPoS.XDPoS); ok {
+		minePeriodCh = xdposEngine.MinePeriodCh
+		newRoundCh = xdposEngine.NewRoundCh
+	}
+
+	timeout := time.NewTimer(time.Duration(minePeriod) * time.Second)
+	defer timeout.Stop()
+
+	// resetTimer rearms the mining timer, which is owned by the update loop and
+	// therefore never accessed from another goroutine. It must only ever be
+	// called from the loop below. Driving the timer from a dedicated goroutine
+	// would require a two-way channel handshake, which deadlocks as soon as
+	// both directions are full: the loop blocks handing over the new duration
+	// while the helper blocks handing over the expiry notification. The
+	// stop-drain-reset sequence follows the standard Timer.Reset pattern from
+	// the time package.
+	resetTimer := func(d time.Duration) {
+		if !timeout.Stop() {
+			// Drain the timer channel if it had already expired.
+			select {
+			case <-timeout.C:
+			default:
+			}
+		}
+		timeout.Reset(d)
+	}
+
+	for {
+		// A real event arrived, process interesting content
+		select {
+		case v := <-minePeriodCh:
+			log.Info("[worker] update wait period", "period", v)
+			minePeriod = v
+			resetTimer(time.Duration(minePeriod) * time.Second)
+
+		case <-timeout.C:
+			if atomic.LoadInt32(&w.mining) == 1 {
+				w.commitNewWork()
+			}
+			resetTimer(getResetTime(w.chain, minePeriod))
+
+		// Handle ChainHeadEvent
+		case <-w.chainHeadCh:
+			w.commitNewWork()
+			resetTimer(getResetTime(w.chain, minePeriod))
+
+		// Handle new round
+		case <-newRoundCh:
+			w.commitNewWork()
+			resetTimer(getResetTime(w.chain, minePeriod))
+
+		// Handle ChainSideEvent
+		case <-w.chainSideCh:
+
+		// Handle NewTxsEvent
+		case ev := <-w.txsCh:
+			// Apply transactions to the pending state if we're not mining.
+			//
+			// Note all transactions received may not be continuous with transactions
+			// already included in the current mining block. These transactions will
+			// be automatically eliminated.
+			if atomic.LoadInt32(&w.mining) == 0 {
+				w.currentMu.Lock()
+				txs := make(map[common.Address][]*txpool.LazyTransaction, len(ev.Txs))
+				for _, tx := range ev.Txs {
+					acc, _ := types.Sender(w.current.signer, tx)
+					txs[acc] = append(txs[acc], &txpool.LazyTransaction{
+						Hash:      tx.Hash(),
+						Tx:        tx,
+						Time:      tx.Time(),
+						GasFeeCap: uint256.MustFromBig(tx.GasFeeCap()),
+						GasTipCap: uint256.MustFromBig(tx.GasTipCap()),
+					})
+				}
+				feeCapacity := w.current.state.GetTRC21FeeCapacityFromState()
+				txset, specialTxs := newTransactionsByPriceAndNonce(w.current.signer, txs, feeCapacity, w.current.header.BaseFee)
+
+				tcount := w.current.tcount
+				w.current.commitTransactions(w.mux, feeCapacity, txset, specialTxs, w.chain, &w.pendingLogsFeed)
+
+				// Only update the snapshot if any new transactions were added
+				// to the pending block
+				if tcount != w.current.tcount {
+					w.updateSnapshot()
+				}
+				w.currentMu.Unlock()
+			} else {
+				// If we're mining, but nothing is being processed, wake on new transactions
+				if w.chainConfig.XDPoS != nil && w.chainConfig.XDPoS.Period == 0 {
+					w.commitNewWork()
+				}
+			}
+
+		case <-w.chainHeadSub.Err():
+			return
+
+		case <-w.chainSideSub.Err():
+			return
+		}
+	}
+}
+
+func (w *worker) getHashrate() int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	total := int64(0)
+	for agent := range w.agents {
+		if _, ok := agent.(*CpuAgent); !ok {
+			total += agent.GetHashRate()
+		}
+	}
+	return total
+}
+
+func getResetTime(chain *core.BlockChain, minePeriod int) time.Duration {
+	var (
+		currentBlockTime   int64         = 0
+		nowTime            int64         = 0
+		resetTime          time.Duration = 0
+		minePeriodDuration time.Duration = time.Duration(minePeriod) * time.Second
+		header             *types.Header = chain.CurrentBlock()
+	)
+	if header != nil {
+		currentBlockTime = int64(header.Time)
+		nowTime = time.Now().UnixMilli()
+		resetTime = time.Duration(currentBlockTime)*time.Second + minePeriodDuration - time.Duration(nowTime)*time.Millisecond
+	}
+	// in case the current block time is not very accurate
+	if resetTime > minePeriodDuration || resetTime <= 0 {
+		resetTime = minePeriodDuration
+	}
+	log.Debug("[update] Miner worker timer reset", "resetTimeSec", resetTime.Seconds(), "minePeriodSec", minePeriod, "currentBlockTimeSec", fmt.Sprintf("%d", currentBlockTime), "currentSystemTimeSec", fmt.Sprintf("%d.%03d", nowTime/1000, nowTime%1000))
+	return resetTime
+}
+
+func (w *worker) wait() {
+	for {
+		mustCommitNewWork := true
+		for result := range w.recv {
+			atomic.AddInt32(&w.atWork, -1)
+
+			if result == nil {
+				continue
+			}
+			block := result.Block
+			work := result.Work
+
+			// Different block could share same sealhash, deep copy here to prevent write-write conflict.
+			hash := block.Hash()
+			receipts := make([]*types.Receipt, len(work.receipts))
+			for i, receipt := range work.receipts {
+				// add block location fields
+				receipt.BlockHash = hash
+				receipt.BlockNumber = block.Number()
+				receipt.TransactionIndex = uint(i)
+
+				receipts[i] = new(types.Receipt)
+				*receipts[i] = *receipt
+			}
+			// Update the block hash in all logs since it is now available and not when the
+			// receipt/log of individual transactions were created.
+			for _, log := range work.state.Logs() {
+				log.BlockHash = hash
+			}
+			// Commit block and state to database.
+			w.currentMu.Lock()
+			stat, err := w.chain.WriteBlockWithState(block, receipts, work.state, work.tradingState, work.lendingState)
+			w.currentMu.Unlock()
+			if err != nil {
+				log.Error("Failed writing block to chain", "err", err)
+				continue
+			}
+			// check if canon block and write transactions
+			if stat == core.CanonStatTy {
+				// implicit by posting ChainHeadEvent
+				mustCommitNewWork = false
+			}
+			// Broadcast the block and announce chain insertion event
+			w.mux.Post(core.NewMinedBlockEvent{Block: block})
+			var (
+				events []interface{}
+				logs   = work.state.Logs()
+			)
+			events = append(events, core.ChainEvent{Block: block, Hash: block.Hash(), Logs: logs})
+			if stat == core.CanonStatTy {
+				events = append(events, core.ChainHeadEvent{Block: block})
+			}
+			if work.config.XDPoS != nil {
+				// epoch block
+				isEpochSwitchBlock, _, err := w.engine.(*XDPoS.XDPoS).IsEpochSwitch(block.Header())
+				if err != nil {
+					log.Error("[wait] fail to check if block is epoch switch block when worker waiting", "BlockNum", block.Number(), "Hash", block.Hash())
+				}
+				if isEpochSwitchBlock {
+					// Signal through the chain, so that the send coalesces instead of waiting:
+					// this runs on the only consumer of w.recv, and a stall here would hold up
+					// the whole mined-block pipeline.
+					core.SignalCheckpoint()
+				}
+			}
+			w.chain.UpdateBlocksHashCache(block)
+			w.chain.PostChainEvents(events, logs)
+
+			// Insert the block into the set of pending ones to wait for confirmations
+			w.unconfirmed.Insert(block.NumberU64(), block.Hash())
+
+			if mustCommitNewWork {
+				w.commitNewWork()
+			}
+
+			if w.chainConfig.XDPoS != nil {
+				c := w.engine.(*XDPoS.XDPoS)
+				err = c.HandleProposedBlock(w.chain, block.Header())
+				if err != nil {
+					log.Warn("[wait] Unable to handle new proposed block", "err", err, "number", block.Number(), "hash", block.Hash())
+				}
+
+				authorized := c.IsAuthorisedAddress(w.chain, block.Header(), w.coinbase)
+				if !authorized {
+					valid := false
+					masternodes := c.GetMasternodes(w.chain, block.Header())
+					for _, m := range masternodes {
+						if m == w.coinbase {
+							valid = true
+							break
+						}
+					}
+					if !valid {
+						log.Error("Coinbase address not in snapshot signers.")
+						return
+					}
+				}
+				// Send tx sign to smart contract blockSigners.
+				if block.NumberU64()%common.MergeSignRange == 0 || !w.chainConfig.IsTIP2019(block.Number()) {
+					if err := contracts.CreateTransactionSign(w.chainConfig, w.eth.TxPool(), w.eth.AccountManager(), block, w.chainDb, w.coinbase); err != nil {
+						log.Error("Fail to create tx sign for signer", "error", err)
+					}
+				}
+			}
+		}
+	}
+}
+
+// push sends a new work task to currently live miner agents.
+func (w *worker) push(work *Work) {
+	if atomic.LoadInt32(&w.mining) != 1 {
+		return
+	}
+	for agent := range w.agents {
+		atomic.AddInt32(&w.atWork, 1)
+		if ch := agent.Work(); ch != nil {
+			ch <- work
+		}
+	}
+}
+
+// copyReceipts makes a deep copy of the given receipts.
+func copyReceipts(receipts []*types.Receipt) []*types.Receipt {
+	result := make([]*types.Receipt, len(receipts))
+	for i, receipt := range receipts {
+		cpyReceipt := *receipt
+		if len(receipt.PostState) > 0 {
+			cpyReceipt.PostState = make([]byte, len(receipt.PostState))
+			copy(cpyReceipt.PostState, receipt.PostState)
+		}
+		if cpyReceipt.EffectiveGasPrice = new(big.Int); receipt.EffectiveGasPrice != nil {
+			cpyReceipt.EffectiveGasPrice.Set(receipt.EffectiveGasPrice)
+		}
+		if cpyReceipt.BlockNumber = new(big.Int); receipt.BlockNumber != nil {
+			cpyReceipt.BlockNumber.Set(receipt.BlockNumber)
+		}
+		// deep copy logs
+		if len(receipt.Logs) > 0 {
+			cpyReceipt.Logs = make([]*types.Log, len(receipt.Logs))
+			for i, log := range receipt.Logs {
+				cpyLog := *log
+				if len(log.Topics) > 0 {
+					cpyLog.Topics = make([]common.Hash, len(log.Topics))
+					copy(cpyLog.Topics, log.Topics)
+				}
+				if len(log.Data) > 0 {
+					cpyLog.Data = make([]byte, len(log.Data))
+					copy(cpyLog.Data, log.Data)
+				}
+				cpyReceipt.Logs[i] = &cpyLog
+			}
+		}
+		result[i] = &cpyReceipt
+	}
+	return result
+}
+
+// updateSnapshot updates pending snapshot block and state.
+// Note this function assumes the current variable is thread safe.
+func (w *worker) updateSnapshot() {
+	w.snapshotMu.Lock()
+	defer w.snapshotMu.Unlock()
+
+	w.snapshotBlock = types.NewBlock(
+		w.current.header,
+		&types.Body{Transactions: w.current.txs},
+		w.current.receipts,
+		trie.NewStackTrie(nil),
+	)
+	w.snapshotReceipts = copyReceipts(w.current.receipts)
+	w.snapshotState = w.current.state.Copy()
+}
+
+// makeCurrent creates a new environment for the current cycle.
+func (w *worker) makeCurrent(parent *types.Block, header *types.Header) error {
+	// Retrieve the parent state to execute on top and start a prefetcher for
+	// the miner to speed block sealing up a bit
+	state, err := w.chain.StateAt(parent.Root())
+	if err != nil {
+		return err
+	}
+
+	author, _ := w.chain.Engine().Author(parent.Header())
+	var XDCxState *tradingstate.TradingStateDB
+	var lendingState *lendingstate.LendingStateDB
+	if w.chainConfig.XDPoS != nil {
+		XDCX := w.eth.GetXDCX()
+		XDCxState, err = XDCX.GetTradingState(parent, author)
+		if err != nil {
+			log.Error("Failed to get XDCx state ", "number", parent.Number(), "err", err)
+			return err
+		}
+		lending := w.eth.GetXDCXLending()
+		lendingState, err = lending.GetLendingState(parent, author)
+		if err != nil {
+			log.Error("Failed to get lending state ", "number", parent.Number(), "err", err)
+			return err
+		}
+	}
+
+	work := &Work{
+		config:       w.chainConfig,
+		signer:       types.MakeSigner(w.chainConfig, header.Number),
+		state:        state,
+		size:         uint64(header.Size()),
+		parentState:  state.Copy(),
+		tradingState: XDCxState,
+		lendingState: lendingState,
+		ancestors:    mapset.NewSet[common.Hash](),
+		family:       mapset.NewSet[common.Hash](),
+		header:       header,
+		evm:          vm.NewEVM(core.NewEVMBlockContext(header, w.chain, &header.Coinbase), state, XDCxState, w.chainConfig, vm.Config{}),
+		uncles:       make(map[common.Hash]*types.Header),
+		createdAt:    time.Now(),
+	}
+
+	// Keep track of transactions which return errors so they can be removed
+	work.tcount = 0
+	w.current = work
+	return nil
+}
+
+// checkPreCommitWithLock checks whether a new work commit is needed with locks,
+// returns the parent block and shouldReturn.
+func (w *worker) checkPreCommitWithLock() (*types.Block, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.uncleMu.Lock()
+	defer w.uncleMu.Unlock()
+	w.currentMu.Lock()
+	defer w.currentMu.Unlock()
+
+	return w.checkPreCommit()
+}
+
+// checkPreCommit checks whether a new work commit is needed,
+// returns the parent block and shouldReturn.
+func (w *worker) checkPreCommit() (*types.Block, bool) {
+	var xdposEngine *XDPoS.XDPoS
+	if engine, ok := w.engine.(*XDPoS.XDPoS); ok {
+		xdposEngine = engine
+	}
+	var parent *types.Block
+	currentHeader := w.chain.CurrentBlock()
+	// Guard against nil header (early startup or uninitialised chain).
+	if currentHeader == nil {
+		return nil, true
+	}
+	if xdposEngine != nil {
+		parent = xdposEngine.FindParentBlockToAssign(w.chain, currentHeader)
+	} else {
+		parent = w.chain.GetBlock(currentHeader.Hash(), currentHeader.Number.Uint64())
+	}
+	if parent == nil {
+		return nil, true
+	}
+	if w.chainConfig.XDPoS != nil && xdposEngine == nil {
+		log.Debug("XDPoS config enabled but consensus engine is not XDPoS")
+		return parent, true
+	}
+	if parent.Hash().Hex() == w.lastParentBlockCommit {
+		return parent, true
+	}
+	if !w.announceTxs && atomic.LoadInt32(&w.mining) == 0 {
+		return parent, true
+	}
+
+	// Only try to commit new work if we are mining
+	if atomic.LoadInt32(&w.mining) == 1 {
+		// check if we are right after parent's coinbase in the list
+		if w.chainConfig.XDPoS != nil && xdposEngine != nil {
+			ok, err := xdposEngine.YourTurn(w.chain, parent.Header(), w.coinbase)
+			if err != nil {
+				log.Warn("Failed when trying to commit new work", "err", err)
+				return parent, true
+			}
+			if !ok {
+				log.Info("Not my turn to commit block. Waiting...")
+				return parent, true
+			}
+		}
+	}
+
+	return parent, false
+}
+
+func (w *worker) commitNewWork() {
+	parent, shouldReturn := w.checkPreCommitWithLock()
+	if parent == nil || shouldReturn {
+		return
+	}
+	tstart := time.Now()
+	tstamp := tstart.Unix()
+	if parent.Time() >= uint64(tstamp) {
+		tstamp = int64(parent.Time() + 1)
+	}
+	// this will ensure we're not going off too far in the future
+	if now := time.Now().Unix(); tstamp > now {
+		wait := time.Duration(tstamp-now) * time.Second
+		log.Info("Mining too far in the future", "wait", common.PrettyDuration(wait))
+		time.Sleep(wait)
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.uncleMu.Lock()
+	defer w.uncleMu.Unlock()
+	w.currentMu.Lock()
+	defer w.currentMu.Unlock()
+
+	parent, shouldReturn = w.checkPreCommit()
+	if parent == nil || shouldReturn {
+		return
+	}
+
+	// Recalculate timestamp in case the parent changed while sleeping.
+	tstamp = time.Now().Unix()
+	if parent.Time() >= uint64(tstamp) {
+		tstamp = int64(parent.Time() + 1)
+	}
+	num := parent.Number()
+	header := &types.Header{
+		ParentHash: parent.Hash(),
+		Number:     num.Add(num, common.Big1),
+		Extra:      w.extra,
+		Time:       uint64(tstamp),
+	}
+	if w.chainConfig.IsDynamicGasLimit(header.Number) {
+		header.GasLimit = core.CalcGasLimit(parent.GasLimit(), w.config.GasCeil)
+	} else {
+		header.GasLimit = w.config.GasCeil
+	}
+	// Set baseFee if we are on an EIP-1559 chain
+	header.BaseFee = eip1559.CalcBaseFee(w.chainConfig, header)
+
+	// Only set the coinbase if we are mining (avoid spurious block rewards)
+	if atomic.LoadInt32(&w.mining) == 1 {
+		header.Coinbase = w.coinbase
+	}
+
+	if err := w.engine.Prepare(w.chain, header); err != nil {
+		if err == consensus.ErrNotReadyToPropose {
+			log.Info("Waiting...", "err", err)
+			return
+		}
+		log.Error("Failed to prepare header for new block", "err", err)
+		return
+	}
+	// If we are care about TheDAO hard-fork check whether to override the extra-data or not
+	if daoBlock := w.chainConfig.DAOForkBlock; daoBlock != nil {
+		// Check whether the block is among the fork extra-override range
+		limit := new(big.Int).Add(daoBlock, params.DAOForkExtraRange)
+		if header.Number.Cmp(daoBlock) >= 0 && header.Number.Cmp(limit) < 0 {
+			// Depending whether we support or oppose the fork, override differently
+			if w.chainConfig.DAOForkSupport {
+				header.Extra = common.CopyBytes(params.DAOForkBlockExtra)
+			} else if bytes.Equal(header.Extra, params.DAOForkBlockExtra) {
+				header.Extra = []byte{} // If miner opposes, don't let it use the reserved extra-data
+			}
+		}
+	}
+	// Could potentially happen if starting to mine in an odd state.
+	err := w.makeCurrent(parent, header)
+	if err != nil {
+		log.Error("Failed to create mining context", "err", err)
+		return
+	}
+	// Create the current work task and check any fork transitions needed
+	work := w.current
+	if w.chainConfig.DAOForkSupport && w.chainConfig.DAOForkBlock != nil && w.chainConfig.DAOForkBlock.Cmp(header.Number) == 0 {
+		misc.ApplyDAOHardFork(work.state)
+	}
+	core.ApplyBlockLevelHooks(header.ParentHash, work.evm)
+	// won't grasp txs at checkpoint
+	var (
+		txs                                                                  *transactionsByPriceAndNonce
+		specialTxs                                                           types.Transactions
+		tradingTxMatches                                                     []tradingstate.TxDataMatch
+		lendingInput                                                         []*lendingstate.LendingItem
+		updatedTrades                                                        map[common.Hash]*lendingstate.LendingTrade
+		liquidatedTrades, autoRepayTrades, autoTopUpTrades, autoRecallTrades []*lendingstate.LendingTrade
+	)
+	feeCapacity := work.state.GetTRC21FeeCapacityFromStateWithCache(parent.Root())
+	if w.chainConfig.XDPoS != nil {
+		isEpochSwitchBlock, _, err := w.engine.(*XDPoS.XDPoS).IsEpochSwitch(header)
+		if err != nil {
+			log.Error("[commitNewWork] fail to check if block is epoch switch block when fetching pending transactions", "BlockNum", header.Number, "Hash", header.Hash())
+		}
+		if !isEpochSwitchBlock {
+			// Retrieve the pending transactions pre-filtered by the 1559 dynamic fees
+			// w.tip is the configured minimum gas-price threshold (historical name),
+			// not an EIP-1559 priority-fee tip.
+			minGasPrice := w.tip
+			filter := pendingFilterForHeader(minGasPrice, header, w.chainConfig)
+			pending := w.eth.TxPool().Pending(filter)
+			txs, specialTxs = newTransactionsByPriceAndNonce(w.current.signer, pending, feeCapacity, header.BaseFee)
+		}
+	}
+	if atomic.LoadInt32(&w.mining) == 1 {
+		wallet, err := w.eth.AccountManager().Find(accounts.Account{Address: w.coinbase})
+		if err != nil {
+			log.Warn("Can't find coinbase account wallet", "coinbase", w.coinbase, "err", err)
+			return
+		}
+		if w.chainConfig.XDPoS != nil && w.chain.Config().IsTIPXDCXMiner(header.Number) {
+			XDCX := w.eth.GetXDCX()
+			XDCXLending := w.eth.GetXDCXLending()
+			if XDCX != nil && header.Number.Uint64() > w.chainConfig.XDPoS.Epoch {
+				isEpochSwitchBlock, epochNumber, err := w.engine.(*XDPoS.XDPoS).IsEpochSwitch(header)
+				if err != nil {
+					log.Error("[commitNewWork] fail to check if block is epoch switch block when performing XDCX and XDCXLending operations", "BlockNum", header.Number, "Hash", header.Hash())
+				}
+
+				if isEpochSwitchBlock {
+					err := XDCX.UpdateMediumPriceBeforeEpoch(epochNumber, work.tradingState, work.state)
+					if err != nil {
+						log.Error("Fail when update medium price last epoch", "error", err)
+						return
+					}
+				} else {
+					// won't grasp tx at checkpoint
+					//https://github.com/XinFinOrg/XDPoSChain-v1/pull/416
+					log.Debug("Start processing order pending")
+					tradingOrderPending, _ := w.eth.OrderPool().Pending()
+					log.Debug("Start processing order pending", "len", len(tradingOrderPending))
+					tradingTxMatches = XDCX.ProcessOrderPending(header, w.coinbase, w.chain, tradingOrderPending, work.state, work.tradingState)
+					log.Debug("trading transaction matches found", "tradingTxMatches", len(tradingTxMatches))
+
+					lendingOrderPending, _ := w.eth.LendingPool().Pending()
+					lendingInput = XDCXLending.ProcessOrderPending(header, w.coinbase, w.chain, lendingOrderPending, work.state, work.lendingState, work.tradingState)
+					log.Debug("lending transaction matches found", "lendingInput", len(lendingInput))
+					if header.Number.Uint64()%w.chainConfig.XDPoS.Epoch == common.LiquidateLendingTradeBlock {
+						updatedTrades, liquidatedTrades, autoRepayTrades, autoTopUpTrades, autoRecallTrades, err = XDCXLending.ProcessLiquidationData(header, w.chain, work.state, work.tradingState, work.lendingState)
+						if err != nil {
+							log.Error("Fail when process lending liquidation data ", "error", err)
+							return
+						}
+					}
+				}
+
+				if len(tradingTxMatches) > 0 {
+					txMatchBatch := &tradingstate.TxMatchBatch{
+						Data:      tradingTxMatches,
+						Timestamp: time.Now().UnixNano(),
+						TxHash:    common.Hash{},
+					}
+					txMatchBytes, err := tradingstate.EncodeTxMatchesBatch(*txMatchBatch)
+					if err != nil {
+						log.Error("Fail to marshal txMatch", "error", err)
+						return
+					}
+					nonce := work.state.GetNonce(w.coinbase)
+					tx := types.NewTransaction(nonce, common.XDCXAddrBinary, big.NewInt(0), txMatchGasLimit, big.NewInt(0), txMatchBytes)
+					txM, err := wallet.SignTx(accounts.Account{Address: w.coinbase}, tx, w.chainConfig.ChainID)
+					if err != nil {
+						log.Error("Fail to create tx matches", "error", err)
+						return
+					}
+					// force adding trading, lending transaction to this block
+					if txM != nil {
+						specialTxs = append(specialTxs, txM)
+					}
+				}
+
+				if len(lendingInput) > 0 {
+					// lending transaction
+					lendingBatch := &lendingstate.TxLendingBatch{
+						Data:      lendingInput,
+						Timestamp: time.Now().UnixNano(),
+						TxHash:    common.Hash{},
+					}
+					lendingDataBytes, err := lendingstate.EncodeTxLendingBatch(*lendingBatch)
+					if err != nil {
+						log.Error("Fail to marshal lendingData", "error", err)
+						return
+					}
+					nonce := work.state.GetNonce(w.coinbase)
+					lendingTx := types.NewTransaction(nonce, common.XDCXLendingAddressBinary, big.NewInt(0), txMatchGasLimit, big.NewInt(0), lendingDataBytes)
+					signedLendingTx, err := wallet.SignTx(accounts.Account{Address: w.coinbase}, lendingTx, w.chainConfig.ChainID)
+					if err != nil {
+						log.Error("Fail to create lending tx", "error", err)
+						return
+					}
+					if signedLendingTx != nil {
+						specialTxs = append(specialTxs, signedLendingTx)
+					}
+				}
+
+				if len(updatedTrades) > 0 {
+					log.Debug("M1 finalized trades")
+					finalizedTradeData, err := lendingstate.EncodeFinalizedResult(liquidatedTrades, autoRepayTrades, autoTopUpTrades, autoRecallTrades)
+					if err != nil {
+						log.Error("Fail to marshal lendingData", "error", err)
+						return
+					}
+					nonce := work.state.GetNonce(w.coinbase)
+					finalizedTx := types.NewTransaction(nonce, common.XDCXLendingFinalizedTradeAddressBinary, big.NewInt(0), txMatchGasLimit, big.NewInt(0), finalizedTradeData)
+					signedFinalizedTx, err := wallet.SignTx(accounts.Account{Address: w.coinbase}, finalizedTx, w.chainConfig.ChainID)
+					if err != nil {
+						log.Error("Fail to create lending tx", "error", err)
+						return
+					}
+					if signedFinalizedTx != nil {
+						specialTxs = append(specialTxs, signedFinalizedTx)
+					}
+				}
+			}
+			XDCxStateRoot := work.tradingState.IntermediateRoot()
+			LendingStateRoot := work.lendingState.IntermediateRoot()
+			txData := append(XDCxStateRoot.Bytes(), LendingStateRoot.Bytes()...)
+			tx := types.NewTransaction(work.state.GetNonce(w.coinbase), common.TradingStateAddrBinary, big.NewInt(0), txMatchGasLimit, big.NewInt(0), txData)
+			txStateRoot, err := wallet.SignTx(accounts.Account{Address: w.coinbase}, tx, w.chainConfig.ChainID)
+			if err != nil {
+				log.Error("Fail to create tx state root", "error", err)
+				return
+			}
+			specialTxs = append(specialTxs, txStateRoot)
+		}
+	}
+	work.commitTransactions(w.mux, feeCapacity, txs, specialTxs, w.chain, &w.pendingLogsFeed)
+	commitEnd := time.Now()
+
+	// compute uncles for the new block.
+	var (
+		uncles []*types.Header
+	)
+
+	// Create the new block to seal with the consensus engine
+	if work.Block, err = w.engine.Finalize(w.chain, header, work.state, work.parentState, work.txs, uncles, work.receipts); err != nil {
+		log.Error("Failed to finalize block for sealing", "err", err)
+		return
+	}
+
+	if atomic.LoadInt32(&w.mining) == 1 {
+		finalizeEnd := time.Now()
+		commitElapsed := commitEnd.Sub(tstart)
+		finalizeElapsed := finalizeEnd.Sub(commitEnd)
+		totalElapsed := finalizeEnd.Sub(tstart)
+		log.Info("Committing new block",
+			"number", work.Block.Number(),
+			"txs", work.tcount,
+			"special_txs", len(specialTxs),
+			"uncles", len(uncles),
+			"commit_time", common.PrettyDuration(commitElapsed),
+			"finalize_time", common.PrettyDuration(finalizeElapsed),
+			"total_time", common.PrettyDuration(totalElapsed),
+		)
+		blockNumberGauge.Update(work.Block.Number().Int64())
+		normalTxsMeter.Update(int64(work.tcount))
+		specialTxsMeter.Update(int64(len(specialTxs)))
+		blockCommitTimer.Update(commitElapsed)
+		blockFinalizeTimer.Update(finalizeElapsed)
+		blockTotalTimer.Update(totalElapsed)
+		w.unconfirmed.Shift(work.Block.NumberU64() - 1)
+		w.lastParentBlockCommit = parent.Hash().Hex()
+	}
+	w.push(work)
+	w.updateSnapshot()
+}
+
+func (w *Work) commitTransactions(mux *event.TypeMux, balanceFee map[common.Address]*big.Int, txs *transactionsByPriceAndNonce, specialTxs types.Transactions, bc *core.BlockChain, pendingLogsFeed *event.Feed) {
+	gp := new(core.GasPool).AddGas(w.header.GasLimit)
+	balanceUpdated := map[common.Address]*big.Int{}
+	totalFeeUsed := big.NewInt(0)
+	var coalescedLogs []*types.Log
+	// first priority for special Txs
+	for _, tx := range specialTxs {
+		if !w.txFitsSize(tx) {
+			log.Debug("Skipping oversized transaction", "hash", tx.Hash(), "size", tx.Size())
+			continue
+		}
+		to := tx.To()
+		if w.config.IsDenylist(w.header.Number) {
+			from := tx.From()
+			// check if sender is in denylist
+			if common.IsInDenylist(from) {
+				log.Debug("Skipping transaction with sender in denylist", "sender", from.Hex())
+				continue
+			}
+			// check if receiver is in denylist
+			if common.IsInDenylist(to) {
+				log.Debug("Skipping transaction with receiver in denylist", "receiver", to.Hex())
+				continue
+			}
+		}
+		data := tx.Data()
+		// validate minFee slot for XDCZ
+		if tx.IsXDCZApplyTransaction(w.config) {
+			copyState, _ := bc.State()
+			if err := core.ValidateXDCZApplyTransaction(bc, nil, copyState, common.BytesToAddress(data[4:])); err != nil {
+				log.Debug("XDCZApply: invalid token", "token", common.BytesToAddress(data[4:]).Hex())
+				continue
+			}
+		}
+		// validate balance slot, token decimal for XDCX
+		if tx.IsXDCXApplyTransaction(w.config) {
+			copyState, _ := bc.State()
+			if err := core.ValidateXDCXApplyTransaction(bc, nil, copyState, common.BytesToAddress(data[4:])); err != nil {
+				log.Debug("XDCXApply: invalid token", "token", common.BytesToAddress(data[4:]).Hex())
+				continue
+			}
+		}
+
+		if gp.Gas() < params.TxGas && tx.Gas() > 0 {
+			log.Warn("Not enough gas for further transactions", "hash", tx.Hash().Hex(), "tx.Gas", tx.Gas(), "gp", gp, "need", params.TxGas)
+			break
+		}
+		// Error may be ignored here. The error has already been checked
+		// during transaction acceptance is the transaction pool.
+		//
+		// We use the eip155 signer regardless of the current hf.
+		from, _ := types.Sender(w.signer, tx)
+		// Check whether the tx is replay protected. If we're not in the EIP155 hf
+		// phase, start ignoring the sender until we do.
+		hash := tx.Hash()
+		if tx.Protected() && !w.config.IsEIP155(w.header.Number) {
+			log.Trace("Ignoring reply protected special transaction", "hash", hash, "eip155", w.config.EIP155Block)
+			continue
+		}
+		if *to == common.BlockSignersBinary {
+			if len(data) < 68 {
+				log.Trace("Data special transaction invalid length", "hash", hash, "data", len(data))
+				continue
+			}
+			blkNumber := new(big.Int).SetBytes(data[4:36]).Uint64()
+			if blkNumber >= w.header.Number.Uint64() {
+				log.Trace("Data special transaction invalid number", "hash", hash, "blkNumber", blkNumber, "miner", w.header.Number)
+				continue
+			}
+		}
+		// Start executing the transaction
+		w.state.SetTxContext(hash, w.tcount)
+
+		nonce := w.state.GetNonce(from)
+		if nonce != tx.Nonce() && !tx.IsSkipNonceTransaction() {
+			log.Trace("Skipping account with special transaction invalid nonce", "sender", from, "nonce", nonce, "tx nonce ", tx.Nonce(), "to", to)
+			continue
+		}
+		logs, tokenFeeUsed, gas, err := w.commitTransaction(balanceFee, tx, gp)
+		switch {
+		case errors.Is(err, core.ErrNonceTooLow):
+			// New head notification data race between the transaction pool and miner, shift
+			log.Trace("Skipping special transaction with low nonce", "sender", from, "nonce", tx.Nonce(), "to", to)
+
+		case errors.Is(err, core.ErrNonceTooHigh):
+			// Reorg notification data race between the transaction pool and miner, skip account =
+			log.Trace("Skipping account with special transaction hight nonce", "sender", from, "nonce", tx.Nonce(), "to", to)
+		case errors.Is(err, nil):
+			// Everything ok, collect the logs and shift in the next transaction from the same account
+			coalescedLogs = append(coalescedLogs, logs...)
+			w.tcount++
+
+		default:
+			// Strange error, discard the transaction and get the next in line (note, the
+			// nonce-too-high clause will prevent us from executing in vain).
+			log.Debug("Add Special Transaction failed, account skipped", "hash", hash, "sender", from, "nonce", tx.Nonce(), "to", to, "err", err)
+		}
+		if tokenFeeUsed {
+			fee := params.GetGasFee(w.header.Number.Uint64(), gas, w.config)
+			balanceFee[*to] = new(big.Int).Sub(balanceFee[*to], fee)
+			balanceUpdated[*to] = balanceFee[*to]
+			totalFeeUsed = totalFeeUsed.Add(totalFeeUsed, fee)
+		}
+	}
+	for {
+		// If we don't have enough gas for any further transactions then we're done
+		if gp.Gas() < params.TxGas {
+			log.Warn("Not enough gas for further transactions", "gp", gp, "need", params.TxGas)
+			break
+		}
+		if txs == nil {
+			log.Info("this block has no transaction")
+			break
+		}
+		// Retrieve the next transaction and abort if all done
+		lazyTx := txs.Peek()
+		if lazyTx == nil {
+			break
+		}
+		resolvedTx := lazyTx.Resolve()
+		if resolvedTx == nil {
+			break
+		}
+		tx := resolvedTx
+		// if inclusion of the transaction would put the block size over the
+		// maximum we allow, don't add any more txs to the payload.
+		if !w.txFitsSize(tx) {
+			log.Debug("Skipping oversized transaction", "hash", tx.Hash(), "size", tx.Size())
+			break
+		}
+		to := tx.To()
+		if w.config.IsDenylist(w.header.Number) {
+			from := tx.From()
+			// check if sender is in denylist
+			if common.IsInDenylist(from) {
+				log.Debug("Skipping transaction with sender in denylist", "sender", from.Hex())
+				txs.Pop()
+				continue
+			}
+			// check if receiver is in denylist
+			if common.IsInDenylist(to) {
+				log.Debug("Skipping transaction with receiver in denylist", "receiver", to.Hex())
+				txs.Shift()
+				continue
+			}
+		}
+		data := tx.Data()
+		// validate minFee slot for XDCZ
+		if tx.IsXDCZApplyTransaction(w.config) {
+			copyState, _ := bc.State()
+			if err := core.ValidateXDCZApplyTransaction(bc, nil, copyState, common.BytesToAddress(data[4:])); err != nil {
+				log.Debug("XDCZApply: invalid token", "token", common.BytesToAddress(data[4:]).Hex())
+				txs.Pop()
+				continue
+			}
+		}
+		// validate balance slot, token decimal for XDCX
+		if tx.IsXDCXApplyTransaction(w.config) {
+			copyState, _ := bc.State()
+			if err := core.ValidateXDCXApplyTransaction(bc, nil, copyState, common.BytesToAddress(data[4:])); err != nil {
+				log.Debug("XDCXApply: invalid token", "token", common.BytesToAddress(data[4:]).Hex())
+				txs.Pop()
+				continue
+			}
+		}
+
+		// Error may be ignored here. The error has already been checked
+		// during transaction acceptance is the transaction pool.
+		//
+		// We use the eip155 signer regardless of the current hf.
+		from, _ := types.Sender(w.signer, tx)
+		hash := tx.Hash()
+		// Check whether the tx is replay protected. If we're not in the EIP155 hf
+		// phase, start ignoring the sender until we do.
+		if tx.Protected() && !w.config.IsEIP155(w.header.Number) {
+			log.Trace("Ignoring reply protected transaction", "hash", hash, "eip155", w.config.EIP155Block)
+			txs.Pop()
+			continue
+		}
+		// Start executing the transaction
+		w.state.SetTxContext(hash, w.tcount)
+		nonce := w.state.GetNonce(from)
+		if nonce > tx.Nonce() {
+			// New head notification data race between the transaction pool and miner, shift
+			log.Trace("Skipping transaction with low nonce", "sender", from, "nonce", tx.Nonce())
+			txs.Shift()
+			continue
+		}
+		if nonce < tx.Nonce() {
+			// Reorg notification data race between the transaction pool and miner, skip account =
+			log.Trace("Skipping account with hight nonce", "sender", from, "nonce", tx.Nonce())
+			txs.Pop()
+			continue
+		}
+		logs, tokenFeeUsed, gas, err := w.commitTransaction(balanceFee, tx, gp)
+		switch {
+		case errors.Is(err, core.ErrGasLimitReached):
+			// Pop the current out-of-gas transaction without shifting in the next from the account
+			log.Warn("Gas limit exceeded for current block", "hash", tx.Hash().Hex(), "tx.Gas", tx.Gas(), "err", err)
+			txs.Pop()
+
+		case errors.Is(err, core.ErrNonceTooLow):
+			// New head notification data race between the transaction pool and miner, shift
+			log.Trace("Skipping transaction with low nonce", "sender", from, "nonce", tx.Nonce())
+			txs.Shift()
+
+		case errors.Is(err, core.ErrNonceTooHigh):
+			// Reorg notification data race between the transaction pool and miner, skip account =
+			log.Trace("Skipping account with high nonce", "sender", from, "nonce", tx.Nonce())
+			txs.Pop()
+
+		case errors.Is(err, nil):
+			// Everything ok, collect the logs and shift in the next transaction from the same account
+			coalescedLogs = append(coalescedLogs, logs...)
+			w.tcount++
+			txs.Shift()
+
+		case errors.Is(err, types.ErrTxTypeNotSupported):
+			// Pop the unsupported transaction without shifting in the next from the account
+			log.Trace("Skipping unsupported transaction type", "sender", from, "type", tx.Type())
+			txs.Pop()
+
+		default:
+			// Strange error, discard the transaction and get the next in line (note, the
+			// nonce-too-high clause will prevent us from executing in vain).
+			log.Debug("Transaction failed, account skipped", "hash", hash, "err", err)
+			txs.Shift()
+		}
+		if tokenFeeUsed {
+			fee := params.GetGasFee(w.header.Number.Uint64(), gas, w.config)
+			balanceFee[*to] = new(big.Int).Sub(balanceFee[*to], fee)
+			balanceUpdated[*to] = balanceFee[*to]
+			totalFeeUsed = totalFeeUsed.Add(totalFeeUsed, fee)
+		}
+	}
+	w.state.UpdateTRC21Fee(balanceUpdated, totalFeeUsed)
+	// make a copy, the state caches the logs and these logs get "upgraded" from pending to mined
+	// logs by filling in the block hash when the block was mined by the local miner. This can
+	// cause a race condition if a log was "upgraded" before the PendingLogsEvent is processed.
+	if len(coalescedLogs) > 0 {
+		cpy := make([]*types.Log, len(coalescedLogs))
+		for i, l := range coalescedLogs {
+			cpy[i] = new(types.Log)
+			*cpy[i] = *l
+		}
+		pendingLogsFeed.Send(cpy)
+	}
+	if w.tcount > 0 {
+		go func(tcount int) {
+			err := mux.Post(core.PendingStateEvent{})
+			if err != nil {
+				log.Warn("[commitTransactions] Error when sending PendingStateEvent", "tcount", tcount)
+			}
+		}(w.tcount)
+	}
+}
+
+func (w *Work) commitTransaction(balanceFee map[common.Address]*big.Int, tx *types.Transaction, gp *core.GasPool) ([]*types.Log, bool, uint64, error) {
+	snap := w.state.Snapshot()
+
+	receipt, gas, tokenFeeUsed, err := core.ApplyTransaction(balanceFee, w.evm, gp, w.state, w.header, tx, &w.header.GasUsed)
+	if err != nil {
+		w.state.RevertToSnapshot(snap)
+		return nil, false, 0, err
+	}
+	w.txs = append(w.txs, tx)
+	w.receipts = append(w.receipts, receipt)
+	w.size += tx.Size()
+
+	return receipt.Logs, tokenFeeUsed, gas, nil
+}

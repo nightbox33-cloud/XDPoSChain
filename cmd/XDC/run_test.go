@@ -1,0 +1,121 @@
+// Copyright 2016 The go-ethereum Authors
+// This file is part of go-ethereum.
+//
+// go-ethereum is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// go-ethereum is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with go-ethereum. If not, see <http://www.gnu.org/licenses/>.
+
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/XinFinOrg/XDPoSChain/internal/cmdtest"
+	"github.com/XinFinOrg/XDPoSChain/rpc"
+	"github.com/docker/docker/pkg/reexec"
+)
+
+type testXDC struct {
+	*cmdtest.TestCmd
+
+	// template variables for expect
+	Datadir   string
+	Etherbase string
+}
+
+func init() {
+	// Run the app if we've been exec'd as "XDC-test" in runGeth.
+	reexec.Register("XDC-test", func() {
+		if err := app.Run(os.Args); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	})
+}
+
+func TestMain(m *testing.M) {
+	// check if we have been reexec'd
+	if reexec.Init() {
+		return
+	}
+	os.Exit(m.Run())
+}
+
+// spawns XDC with the given command line args. If the args don't set --datadir, the
+// child g gets a temporary data directory.
+func runXDC(t *testing.T, args ...string) *testXDC {
+	tt := &testXDC{}
+	tt.TestCmd = cmdtest.NewTestCmd(t, tt)
+	for i, arg := range args {
+		switch arg {
+		case "--datadir":
+			if i < len(args)-1 {
+				tt.Datadir = args[i+1]
+			}
+		case "--miner-etherbase":
+			if i < len(args)-1 {
+				tt.Etherbase = args[i+1]
+			}
+		}
+	}
+	if tt.Datadir == "" {
+		// The temporary datadir will be removed automatically if something fails below.
+		tt.Datadir = t.TempDir()
+		tt.Cleanup = func() { os.RemoveAll(tt.Datadir) }
+		args = append([]string{"--datadir", tt.Datadir}, args...)
+	}
+
+	// Boot "XDC". This actually runs the test binary but the TestMain
+	// function will prevent any tests from running.
+	tt.Run("XDC-test", args...)
+
+	return tt
+}
+
+// waitForEndpoint blocks until the given RPC endpoint accepts connections and
+// answers rpc_modules, or until the timeout expires. Node startup takes an
+// unpredictable amount of time under load, so tests must not rely on a fixed
+// sleep before attaching to a freshly started node.
+//
+// The endpoint is dialled as given by rpc.DialContext, so it must be a bare IPC
+// path or a URL carrying a scheme rpc knows (http, https, ws, wss, stdio). The
+// legacy "ipc:" and "rpc:" prefixes are not accepted here even though the attach
+// command accepts them: resolveConsoleEndpoint strips those prefixes for
+// dialRPC, and this helper goes through neither.
+func waitForEndpoint(t *testing.T, endpoint string, timeout time.Duration) {
+	probe := func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		c, err := rpc.DialContext(ctx, endpoint)
+		if c != nil {
+			_, err = c.SupportedModules()
+			c.Close()
+		}
+		return err == nil
+	}
+
+	start := time.Now()
+	for {
+		if probe() {
+			return
+		}
+		if time.Since(start) > timeout {
+			t.Fatal("endpoint", endpoint, "did not open within", timeout)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}

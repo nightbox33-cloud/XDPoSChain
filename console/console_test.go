@@ -1,0 +1,492 @@
+// Copyright 2015 The go-ethereum Authors
+// This file is part of the go-ethereum library.
+//
+// The go-ethereum library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The go-ethereum library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+
+package console
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"os"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/XinFinOrg/XDPoSChain/XDCx"
+	"github.com/XinFinOrg/XDPoSChain/XDCxlending"
+	"github.com/XinFinOrg/XDPoSChain/common"
+	"github.com/XinFinOrg/XDPoSChain/common/hexutil"
+	"github.com/XinFinOrg/XDPoSChain/console/prompt"
+	"github.com/XinFinOrg/XDPoSChain/core"
+	"github.com/XinFinOrg/XDPoSChain/eth"
+	"github.com/XinFinOrg/XDPoSChain/eth/ethconfig"
+	"github.com/XinFinOrg/XDPoSChain/internal/jsre"
+	"github.com/XinFinOrg/XDPoSChain/miner"
+	"github.com/XinFinOrg/XDPoSChain/node"
+	"github.com/XinFinOrg/XDPoSChain/rpc"
+	"github.com/dop251/goja"
+)
+
+const (
+	testInstance = "console-tester"
+	testAddress  = "0x8605cdbbdb6d264aa742e77020dcbc58fcdce182"
+)
+
+// hookedPrompter implements UserPrompter to simulate use input via channels.
+type hookedPrompter struct {
+	scheduler chan string
+}
+
+func (p *hookedPrompter) PromptInput(prompt string) (string, error) {
+	// Send the prompt to the tester
+	select {
+	case p.scheduler <- prompt:
+	case <-time.After(time.Second):
+		return "", errors.New("prompt timeout")
+	}
+	// Retrieve the response and feed to the console
+	select {
+	case input := <-p.scheduler:
+		return input, nil
+	case <-time.After(time.Second):
+		return "", errors.New("input timeout")
+	}
+}
+
+func (p *hookedPrompter) PromptPassword(prompt string) (string, error) {
+	return "", errors.New("not implemented")
+}
+
+func (p *hookedPrompter) PromptConfirm(prompt string) (bool, error) {
+	return false, errors.New("not implemented")
+}
+
+func (p *hookedPrompter) SetHistory(history []string)                     {}
+func (p *hookedPrompter) AppendHistory(command string)                    {}
+func (p *hookedPrompter) ClearHistory()                                   {}
+func (p *hookedPrompter) SetWordCompleter(completer prompt.WordCompleter) {}
+
+// tester is a console test environment for the console tests to operate on.
+type tester struct {
+	workspace string
+	stack     *node.Node
+	ethereum  *eth.Ethereum
+	console   *Console
+	input     *hookedPrompter
+	output    *bytes.Buffer
+}
+
+// newTester creates a test environment based on which the console can operate.
+// Please ensure you call Close() on the returned tester to avoid leaks.
+func newTester(t *testing.T, confOverride func(*ethconfig.Config)) *tester {
+	// Create a temporary storage for the node keys and initialize it
+	workspace := t.TempDir()
+
+	// Create a networkless protocol stack and start an Ethereum service within
+	stack, err := node.New(&node.Config{DataDir: workspace, UseLightweightKDF: true, Name: testInstance})
+	if err != nil {
+		t.Fatalf("failed to create node: %v", err)
+	}
+	ethConf := &ethconfig.Config{
+		Genesis: core.DeveloperGenesisBlock(15, common.Address{}),
+		Miner: miner.Config{
+			Etherbase: common.HexToAddress(testAddress),
+		},
+	}
+	if confOverride != nil {
+		confOverride(ethConf)
+	}
+	ethBackend, err := eth.New(stack, ethConf, &XDCx.XDCX{}, &XDCxlending.Lending{})
+	if err != nil {
+		t.Fatalf("failed to register Ethereum protocol: %v", err)
+	}
+	// Start the node and assemble the JavaScript console around it
+	if err = stack.Start(); err != nil {
+		t.Fatalf("failed to start test stack: %v", err)
+	}
+	client := stack.Attach()
+	t.Cleanup(func() {
+		client.Close()
+	})
+
+	prompter := &hookedPrompter{scheduler: make(chan string)}
+	printer := new(bytes.Buffer)
+
+	console, err := New(Config{
+		DataDir:        stack.DataDir(),
+		DocRoot:        "testdata",
+		Client:         client,
+		LocalTransport: true,
+		Prompter:       prompter,
+		Printer:        printer,
+		Preload:        []string{"preload.js"},
+	})
+	if err != nil {
+		t.Fatalf("failed to create JavaScript console: %v", err)
+	}
+	// Create the final tester and return
+
+	return &tester{
+		workspace: workspace,
+		stack:     stack,
+		ethereum:  ethBackend,
+		console:   console,
+		input:     prompter,
+		output:    printer,
+	}
+}
+
+// Close cleans up any temporary data folders and held resources.
+func (env *tester) Close(t *testing.T) {
+	if err := env.console.Stop(false); err != nil {
+		t.Errorf("failed to stop embedded console: %v", err)
+	}
+	if err := env.stack.Close(); err != nil {
+		t.Errorf("failed to tear down embedded node: %v", err)
+	}
+	os.RemoveAll(env.workspace)
+}
+
+// Tests that the node lists the correct welcome message, notably that it contains
+// the instance name, block number, data directory and supported console modules.
+func TestWelcome(t *testing.T) {
+	tester := newTester(t, nil)
+	defer tester.Close(t)
+
+	tester.console.Welcome()
+
+	output := tester.output.String()
+	if want := "Welcome"; !strings.Contains(output, want) {
+		t.Fatalf("console output missing welcome message: have\n%s\nwant also %s", output, want)
+	}
+	if want := fmt.Sprintf("instance: %s", testInstance); !strings.Contains(output, want) {
+		t.Fatalf("console output missing instance: have\n%s\nwant also %s", output, want)
+	}
+	if want := "at block: 0"; !strings.Contains(output, want) {
+		t.Fatalf("console output missing sync status: have\n%s\nwant also %s", output, want)
+	}
+	if want := fmt.Sprintf("datadir: %s", tester.workspace); !strings.Contains(output, want) {
+		t.Fatalf("console output missing datadir: have\n%s\nwant also %s", output, want)
+	}
+	if want := "modules: "; !strings.Contains(output, want) {
+		t.Fatalf("console output missing modules: have\n%s\nwant also %s", output, want)
+	}
+}
+
+// Tests that JavaScript statement evaluation works as intended.
+func TestEvaluate(t *testing.T) {
+	tester := newTester(t, nil)
+	defer tester.Close(t)
+
+	tester.console.Evaluate("2 + 2")
+	if output := tester.output.String(); !strings.Contains(output, "4") {
+		t.Fatalf("statement evaluation failed: have %s, want %s", output, "4")
+	}
+}
+
+type debugPrintAndSetHeadRPC struct{}
+
+func (debugPrintAndSetHeadRPC) PrintBlock(uint64) (string, error) {
+	return "ok", nil
+}
+
+func (debugPrintAndSetHeadRPC) SetHead(hexutil.Uint64) error {
+	return nil
+}
+
+func TestConsoleHidesUnavailableDebugSetHead(t *testing.T) {
+	t.Run("hidden on remote transport", func(t *testing.T) {
+		console := newRPCConsole(t, debugPrintAndSetHeadRPC{}, false)
+		defer stopConsole(t, console)
+		assertDebugSetHeadVisible(t, console, false)
+		assertDebugSetHeadCompletion(t, console, false)
+		assertDebugSetHeadEnumerated(t, console, false)
+		assertDebugSetHeadPrettyPrinted(t, console, false)
+	})
+
+	t.Run("kept on local transport", func(t *testing.T) {
+		console := newRPCConsole(t, debugPrintAndSetHeadRPC{}, true)
+		defer stopConsole(t, console)
+		assertDebugSetHeadVisible(t, console, true)
+		assertDebugSetHeadCompletion(t, console, true)
+		assertDebugSetHeadEnumerated(t, console, true)
+		assertDebugSetHeadPrettyPrinted(t, console, true)
+	})
+}
+
+func newRPCConsole(t *testing.T, debugService interface{}, localTransport bool) *Console {
+	t.Helper()
+
+	server := rpc.NewServer()
+	if err := server.RegisterName("debug", debugService); err != nil {
+		t.Fatalf("failed to register debug service: %v", err)
+	}
+	client := rpc.DialInProc(server)
+	t.Cleanup(func() {
+		client.Close()
+	})
+
+	console, err := New(Config{
+		DataDir:        t.TempDir(),
+		DocRoot:        "testdata",
+		Client:         client,
+		LocalTransport: localTransport,
+		Printer:        new(bytes.Buffer),
+	})
+	if err != nil {
+		t.Fatalf("failed to create console: %v", err)
+	}
+	return console
+}
+
+func stopConsole(t *testing.T, console *Console) {
+	t.Helper()
+	if err := console.Stop(false); err != nil {
+		t.Fatalf("failed to stop console: %v", err)
+	}
+}
+
+func assertDebugSetHeadVisible(t *testing.T, console *Console, want bool) {
+	t.Helper()
+
+	console.jsre.Do(func(vm *goja.Runtime) {
+		debug := getObject(vm, "debug")
+		if debug == nil {
+			t.Fatal("debug object is not available")
+		}
+		got := !goja.IsUndefined(debug.Get("setHead"))
+		if got != want {
+			t.Fatalf("unexpected debug.setHead visibility: got %v want %v", got, want)
+		}
+	})
+}
+
+func assertDebugSetHeadCompletion(t *testing.T, console *Console, want bool) {
+	t.Helper()
+
+	tests := []struct {
+		input string
+		want  []string
+	}{
+		{input: "debug.setH", want: []string{"debug.setHead", "debug.setHead(", "debug.setHead."}},
+		{input: "debug.setHead", want: []string{"debug.setHead", "debug.setHead(", "debug.setHead."}},
+		{input: "web3.debug.setH", want: []string{"web3.debug.setHead", "web3.debug.setHead(", "web3.debug.setHead."}},
+		{input: "web3.debug.setHead", want: []string{"web3.debug.setHead", "web3.debug.setHead(", "web3.debug.setHead."}},
+	}
+	for _, test := range tests {
+		_, completions, _ := console.AutoCompleteInput(test.input, len(test.input))
+		got := false
+		for _, completion := range completions {
+			if slices.Contains(test.want, completion) {
+				got = true
+				break
+			}
+		}
+		if got != want {
+			t.Fatalf("unexpected debug.setHead completion visibility for %q: got %v want %v (completions=%v)", test.input, got, want, completions)
+		}
+	}
+}
+
+func assertDebugSetHeadEnumerated(t *testing.T, console *Console, want bool) {
+	t.Helper()
+
+	console.jsre.Do(func(vm *goja.Runtime) {
+		keys := getObject(vm, "Object")
+		if keys == nil {
+			t.Fatal("Object is not available")
+		}
+		keysFunc, ok := goja.AssertFunction(keys.Get("keys"))
+		if !ok {
+			t.Fatal("Object.keys is not available")
+		}
+		debug := getObject(vm, "debug")
+		if debug == nil {
+			t.Fatal("debug object is not available")
+		}
+		rv, err := keysFunc(goja.Undefined(), debug)
+		if err != nil {
+			t.Fatalf("Object.keys(debug) failed: %v", err)
+		}
+		got := false
+		switch keys := rv.Export().(type) {
+		case []any:
+			for _, key := range keys {
+				if key.(string) == "setHead" {
+					got = true
+					break
+				}
+			}
+		case []string:
+			if slices.Contains(keys, "setHead") {
+				got = true
+			}
+		default:
+			t.Fatalf("Object.keys(debug) returned unexpected type %T", keys)
+		}
+		if got != want {
+			t.Fatalf("unexpected debug.setHead enumeration visibility: got %v want %v", got, want)
+		}
+	})
+}
+
+func assertDebugSetHeadPrettyPrinted(t *testing.T, console *Console, want bool) {
+	t.Helper()
+
+	printer, ok := console.printer.(*bytes.Buffer)
+	if !ok {
+		t.Fatal("console printer is not a bytes.Buffer")
+	}
+	printer.Reset()
+	console.Evaluate("debug")
+	got := strings.Contains(printer.String(), "setHead")
+	if got != want {
+		t.Fatalf("unexpected debug.setHead pretty-print visibility: got %v want %v output=%q", got, want, printer.String())
+	}
+}
+
+// Tests that the console can be used in interactive mode.
+func TestInteractive(t *testing.T) {
+	// Create a tester and run an interactive console in the background
+	tester := newTester(t, nil)
+	defer tester.Close(t)
+
+	go tester.console.Interactive()
+
+	// Wait for a promt and send a statement back
+	select {
+	case <-tester.input.scheduler:
+	case <-time.After(time.Second):
+		t.Fatalf("initial prompt timeout")
+	}
+	select {
+	case tester.input.scheduler <- "2+2":
+	case <-time.After(time.Second):
+		t.Fatalf("input feedback timeout")
+	}
+	// Wait for the second promt and ensure first statement was evaluated
+	select {
+	case <-tester.input.scheduler:
+	case <-time.After(time.Second):
+		t.Fatalf("secondary prompt timeout")
+	}
+	if output := tester.output.String(); !strings.Contains(output, "4") {
+		t.Fatalf("statement evaluation failed: have %s, want %s", output, "4")
+	}
+}
+
+// Tests that preloaded JavaScript files have been executed before user is given
+// input.
+func TestPreload(t *testing.T) {
+	tester := newTester(t, nil)
+	defer tester.Close(t)
+
+	tester.console.Evaluate("preloaded")
+	if output := tester.output.String(); !strings.Contains(output, "some-preloaded-string") {
+		t.Fatalf("preloaded variable missing: have %s, want %s", output, "some-preloaded-string")
+	}
+}
+
+// Tests that the JavaScript objects returned by statement executions are properly
+// pretty printed instead of just displaing "[object]".
+func TestPrettyPrint(t *testing.T) {
+	tester := newTester(t, nil)
+	defer tester.Close(t)
+
+	tester.console.Evaluate("obj = {int: 1, string: 'two', list: [3, 3, 3], obj: {null: null, func: function(){}}}")
+
+	// Define some specially formatted fields
+	var (
+		one   = jsre.NumberColor("1")
+		two   = jsre.StringColor("\"two\"")
+		three = jsre.NumberColor("3")
+		null  = jsre.SpecialColor("null")
+		fun   = jsre.FunctionColor("function()")
+	)
+	// Assemble the actual output we're after and verify
+	want := `{
+  int: ` + one + `,
+  list: [` + three + `, ` + three + `, ` + three + `],
+  obj: {
+    null: ` + null + `,
+    func: ` + fun + `
+  },
+  string: ` + two + `
+}
+`
+	if output := tester.output.String(); output != want {
+		t.Fatalf("pretty print mismatch: have %s, want %s", output, want)
+	}
+}
+
+// Tests that the JavaScript exceptions are properly formatted and colored.
+func TestPrettyError(t *testing.T) {
+	tester := newTester(t, nil)
+	defer tester.Close(t)
+	tester.console.Evaluate("throw 'hello'")
+
+	want := jsre.ErrorColor("hello") + "\n\tat <eval>:1:1(1)\n\n"
+	if output := tester.output.String(); output != want {
+		t.Fatalf("pretty error mismatch: have %s, want %s", output, want)
+	}
+}
+
+// Tests that tests if the number of indents for JS input is calculated correct.
+func TestIndenting(t *testing.T) {
+	testCases := []struct {
+		input               string
+		expectedIndentCount int
+	}{
+		{`var a = 1;`, 0},
+		{`"some string"`, 0},
+		{`"some string with (parentesis`, 0},
+		{`"some string with newline
+		("`, 0},
+		{`function v(a,b) {}`, 0},
+		{`function f(a,b) { var str = "asd("; };`, 0},
+		{`function f(a) {`, 1},
+		{`function f(a, function(b) {`, 2},
+		{`function f(a, function(b) {
+		     var str = "a)}";
+		  });`, 0},
+		{`function f(a,b) {
+		   var str = "a{b(" + a, ", " + b;
+		   }`, 0},
+		{`var str = "\"{"`, 0},
+		{`var str = "'("`, 0},
+		{`var str = "\\{"`, 0},
+		{`var str = "\\\\{"`, 0},
+		{`var str = 'a"{`, 0},
+		{`var obj = {`, 1},
+		{`var obj = { {a:1`, 2},
+		{`var obj = { {a:1}`, 1},
+		{`var obj = { {a:1}, b:2}`, 0},
+		{`var obj = {}`, 0},
+		{`var obj = {
+			a: 1, b: 2
+		}`, 0},
+		{`var test = }`, -1},
+		{`var str = "a\""; var obj = {`, 1},
+	}
+
+	for i, tt := range testCases {
+		counted := countIndents(tt.input)
+		if counted != tt.expectedIndentCount {
+			t.Errorf("test %d: invalid indenting: have %d, want %d", i, counted, tt.expectedIndentCount)
+		}
+	}
+}

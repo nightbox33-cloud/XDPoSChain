@@ -1,0 +1,963 @@
+// Copyright 2014 The go-ethereum Authors
+// This file is part of the go-ethereum library.
+//
+// The go-ethereum library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The go-ethereum library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+
+package vm
+
+import (
+	"crypto/sha256"
+	"encoding/binary"
+	"errors"
+	"maps"
+	"math"
+	"math/big"
+
+	"github.com/XinFinOrg/XDPoSChain/common"
+	"github.com/XinFinOrg/XDPoSChain/common/bitutil"
+	"github.com/XinFinOrg/XDPoSChain/core/tracing"
+	"github.com/XinFinOrg/XDPoSChain/core/vm/privacy"
+	"github.com/XinFinOrg/XDPoSChain/crypto"
+	"github.com/XinFinOrg/XDPoSChain/crypto/blake2b"
+	"github.com/XinFinOrg/XDPoSChain/crypto/bn256"
+	"github.com/XinFinOrg/XDPoSChain/crypto/secp256r1"
+	"github.com/XinFinOrg/XDPoSChain/params"
+	patched_big "github.com/ethereum/go-bigmodexpfix/src/math/big"
+	"golang.org/x/crypto/ripemd160"
+)
+
+// PrecompiledContract is the basic interface for native Go contracts. The implementation
+// requires a deterministic gas count based on the input size of the Run method of the
+// contract.
+type PrecompiledContract interface {
+	RequiredGas(input []byte) uint64  // RequiredPrice calculates the contract gas use
+	Run(input []byte) ([]byte, error) // Run runs the precompiled contract
+	Name() string
+}
+
+// PrecompiledContracts contains the precompiled contracts supported at the given fork.
+type PrecompiledContracts map[common.Address]PrecompiledContract
+
+// PrecompiledContractsHomestead contains the default set of pre-compiled Ethereum
+// contracts used in the Frontier and Homestead releases.
+var PrecompiledContractsHomestead = PrecompiledContracts{
+	common.BytesToAddress([]byte{1}): &ecrecover{},
+	common.BytesToAddress([]byte{2}): &sha256hash{},
+	common.BytesToAddress([]byte{3}): &ripemd160hash{},
+	common.BytesToAddress([]byte{4}): &dataCopy{},
+}
+
+// PrecompiledContractsByzantium contains the default set of pre-compiled Ethereum
+// contracts used in the Byzantium release.
+var PrecompiledContractsByzantium = PrecompiledContracts{
+	common.BytesToAddress([]byte{1}):  &ecrecover{},
+	common.BytesToAddress([]byte{2}):  &sha256hash{},
+	common.BytesToAddress([]byte{3}):  &ripemd160hash{},
+	common.BytesToAddress([]byte{4}):  &dataCopy{},
+	common.BytesToAddress([]byte{5}):  &bigModExp{eip2565: false, eip7823: false, eip7883: false},
+	common.BytesToAddress([]byte{6}):  &bn256AddByzantium{},
+	common.BytesToAddress([]byte{7}):  &bn256ScalarMulByzantium{},
+	common.BytesToAddress([]byte{8}):  &bn256PairingByzantium{},
+	common.BytesToAddress([]byte{30}): &ringSignatureVerifier{},
+	common.BytesToAddress([]byte{40}): &bulletproofVerifier{},
+	common.BytesToAddress([]byte{41}): &XDCxLastPrice{},
+	common.BytesToAddress([]byte{42}): &XDCxEpochPrice{},
+}
+
+// PrecompiledContractsIstanbul contains the default set of pre-compiled Ethereum
+// contracts used in the Istanbul release.
+var PrecompiledContractsIstanbul = PrecompiledContracts{
+	common.BytesToAddress([]byte{1}):  &ecrecover{},
+	common.BytesToAddress([]byte{2}):  &sha256hash{},
+	common.BytesToAddress([]byte{3}):  &ripemd160hash{},
+	common.BytesToAddress([]byte{4}):  &dataCopy{},
+	common.BytesToAddress([]byte{5}):  &bigModExp{eip2565: false, eip7823: false, eip7883: false},
+	common.BytesToAddress([]byte{6}):  &bn256AddIstanbul{},
+	common.BytesToAddress([]byte{7}):  &bn256ScalarMulIstanbul{},
+	common.BytesToAddress([]byte{8}):  &bn256PairingIstanbul{},
+	common.BytesToAddress([]byte{9}):  &blake2F{},
+	common.BytesToAddress([]byte{30}): &ringSignatureVerifier{},
+	common.BytesToAddress([]byte{40}): &bulletproofVerifier{},
+	common.BytesToAddress([]byte{41}): &XDCxLastPrice{},
+	common.BytesToAddress([]byte{42}): &XDCxEpochPrice{},
+}
+
+// PrecompiledContractsXDCv2 contains the default set of pre-compiled Ethereum
+// contracts used in the XDC v2 release.
+var PrecompiledContractsXDCv2 = PrecompiledContracts{
+	common.BytesToAddress([]byte{1}): &ecrecover{},
+	common.BytesToAddress([]byte{2}): &sha256hash{},
+	common.BytesToAddress([]byte{3}): &ripemd160hash{},
+	common.BytesToAddress([]byte{4}): &dataCopy{},
+	common.BytesToAddress([]byte{5}): &bigModExp{eip2565: false, eip7823: false, eip7883: false},
+	common.BytesToAddress([]byte{6}): &bn256AddIstanbul{},
+	common.BytesToAddress([]byte{7}): &bn256ScalarMulIstanbul{},
+	common.BytesToAddress([]byte{8}): &bn256PairingIstanbul{},
+	common.BytesToAddress([]byte{9}): &blake2F{},
+}
+
+// PrecompiledContractsEIP1559 contains the set of pre-compiled Ethereum
+// contracts used in the EIP1559 release.
+var PrecompiledContractsEIP1559 = PrecompiledContracts{
+	common.BytesToAddress([]byte{1}): &ecrecover{},
+	common.BytesToAddress([]byte{2}): &sha256hash{},
+	common.BytesToAddress([]byte{3}): &ripemd160hash{},
+	common.BytesToAddress([]byte{4}): &dataCopy{},
+	common.BytesToAddress([]byte{5}): &bigModExp{eip2565: true, eip7823: false, eip7883: false},
+	common.BytesToAddress([]byte{6}): &bn256AddIstanbul{},
+	common.BytesToAddress([]byte{7}): &bn256ScalarMulIstanbul{},
+	common.BytesToAddress([]byte{8}): &bn256PairingIstanbul{},
+	common.BytesToAddress([]byte{9}): &blake2F{},
+}
+
+// PrecompiledContractsPrague contains the set of pre-compiled Ethereum
+// contracts used in the Prague release.
+//
+// The 0x0a entry is an always-failing stub: XDC has no blob ecosystem and
+// deliberately does not implement the EIP-4844 point evaluation precompile,
+// but leaving the address unregistered would make calls to it silently succeed
+// as calls to an empty account.
+//
+// Only Prague and Osaka carry the stub. This fork has no Cancun bucket at all:
+// the Cancun networks (mainnet, Apothem) keep using the EIP1559 bucket, so no
+// already-activated bucket gains the entry and the semantics of past blocks
+// stay unchanged. Prague itself is still nil on mainnet and Apothem; devnet
+// (chainId 551) schedules it at block 50000 and is treated as resetable.
+//
+// EIP-2537 (0x0b-0x11) is provided by this bucket as well, and is reachable on
+// exactly the same networks: the ones that schedule Prague.
+var PrecompiledContractsPrague = PrecompiledContracts{
+	common.BytesToAddress([]byte{0x01}): &ecrecover{},
+	common.BytesToAddress([]byte{0x02}): &sha256hash{},
+	common.BytesToAddress([]byte{0x03}): &ripemd160hash{},
+	common.BytesToAddress([]byte{0x04}): &dataCopy{},
+	common.BytesToAddress([]byte{0x05}): &bigModExp{eip2565: true, eip7823: false, eip7883: false},
+	common.BytesToAddress([]byte{0x06}): &bn256AddIstanbul{},
+	common.BytesToAddress([]byte{0x07}): &bn256ScalarMulIstanbul{},
+	common.BytesToAddress([]byte{0x08}): &bn256PairingIstanbul{},
+	common.BytesToAddress([]byte{0x09}): &blake2F{},
+	common.BytesToAddress([]byte{0x0a}): kzgStub,
+	common.BytesToAddress([]byte{0x0b}): &bls12381G1Add{},
+	common.BytesToAddress([]byte{0x0c}): &bls12381G1MultiExp{},
+	common.BytesToAddress([]byte{0x0d}): &bls12381G2Add{},
+	common.BytesToAddress([]byte{0x0e}): &bls12381G2MultiExp{},
+	common.BytesToAddress([]byte{0x0f}): &bls12381Pairing{},
+	common.BytesToAddress([]byte{0x10}): &bls12381MapG1{},
+	common.BytesToAddress([]byte{0x11}): &bls12381MapG2{},
+}
+
+// PrecompiledContractsOsaka contains the set of pre-compiled Ethereum
+// contracts used in the Osaka release.
+//
+// NOTE: this set is built by hand rather than derived from an earlier set, so
+// precompiles registered for another fork are not carried over automatically.
+// Whenever a new precompile set is added, check whether it belongs here too:
+// anything missing from this map is silently dropped once Osaka activates.
+var PrecompiledContractsOsaka = PrecompiledContracts{
+	common.BytesToAddress([]byte{0x01}): &ecrecover{},
+	common.BytesToAddress([]byte{0x02}): &sha256hash{},
+	common.BytesToAddress([]byte{0x03}): &ripemd160hash{},
+	common.BytesToAddress([]byte{0x04}): &dataCopy{},
+	common.BytesToAddress([]byte{0x05}): &bigModExp{eip2565: true, eip7823: true, eip7883: true},
+	common.BytesToAddress([]byte{0x06}): &bn256AddIstanbul{},
+	common.BytesToAddress([]byte{0x07}): &bn256ScalarMulIstanbul{},
+	common.BytesToAddress([]byte{0x08}): &bn256PairingIstanbul{},
+	common.BytesToAddress([]byte{0x09}): &blake2F{},
+	common.BytesToAddress([]byte{0x0a}): kzgStub,
+	common.BytesToAddress([]byte{0x0b}): &bls12381G1Add{},
+	common.BytesToAddress([]byte{0x0c}): &bls12381G1MultiExp{},
+	common.BytesToAddress([]byte{0x0d}): &bls12381G2Add{},
+	common.BytesToAddress([]byte{0x0e}): &bls12381G2MultiExp{},
+	common.BytesToAddress([]byte{0x0f}): &bls12381Pairing{},
+	common.BytesToAddress([]byte{0x10}): &bls12381MapG1{},
+	common.BytesToAddress([]byte{0x11}): &bls12381MapG2{},
+
+	common.BytesToAddress([]byte{0x1, 0x00}): &p256Verify{},
+}
+
+var (
+	PrecompiledAddressesPrague    []common.Address
+	PrecompiledAddressesOsaka     []common.Address
+	PrecompiledAddressesEIP1559   []common.Address
+	PrecompiledAddressesXDCv2     []common.Address
+	PrecompiledAddressesIstanbul  []common.Address
+	PrecompiledAddressesByzantium []common.Address
+	PrecompiledAddressesHomestead []common.Address
+)
+
+func init() {
+	for k := range PrecompiledContractsHomestead {
+		PrecompiledAddressesHomestead = append(PrecompiledAddressesHomestead, k)
+	}
+	for k := range PrecompiledContractsByzantium {
+		PrecompiledAddressesByzantium = append(PrecompiledAddressesByzantium, k)
+	}
+	for k := range PrecompiledContractsIstanbul {
+		PrecompiledAddressesIstanbul = append(PrecompiledAddressesIstanbul, k)
+	}
+	for k := range PrecompiledContractsXDCv2 {
+		PrecompiledAddressesXDCv2 = append(PrecompiledAddressesXDCv2, k)
+	}
+	for k := range PrecompiledContractsEIP1559 {
+		PrecompiledAddressesEIP1559 = append(PrecompiledAddressesEIP1559, k)
+	}
+	for k := range PrecompiledContractsPrague {
+		PrecompiledAddressesPrague = append(PrecompiledAddressesPrague, k)
+	}
+	for k := range PrecompiledContractsOsaka {
+		PrecompiledAddressesOsaka = append(PrecompiledAddressesOsaka, k)
+	}
+}
+
+func activePrecompiledContracts(rules params.Rules) PrecompiledContracts {
+	switch {
+	case rules.IsOsaka:
+		return PrecompiledContractsOsaka
+	case rules.IsPrague:
+		return PrecompiledContractsPrague
+	case rules.IsEIP1559:
+		return PrecompiledContractsEIP1559
+	case rules.IsXDCxDisable:
+		return PrecompiledContractsXDCv2
+	case rules.IsIstanbul:
+		return PrecompiledContractsIstanbul
+	case rules.IsByzantium:
+		return PrecompiledContractsByzantium
+	default:
+		return PrecompiledContractsHomestead
+	}
+}
+
+// ActivePrecompiledContracts returns a copy of precompiled contracts enabled with the current configuration.
+func ActivePrecompiledContracts(rules params.Rules) PrecompiledContracts {
+	return maps.Clone(activePrecompiledContracts(rules))
+}
+
+// ActivePrecompiles returns the precompile addresses enabled with the current configuration.
+func ActivePrecompiles(rules params.Rules) []common.Address {
+	switch {
+	case rules.IsOsaka:
+		return PrecompiledAddressesOsaka
+	case rules.IsPrague:
+		return PrecompiledAddressesPrague
+	case rules.IsEIP1559:
+		return PrecompiledAddressesEIP1559
+	case rules.IsXDCxDisable:
+		return PrecompiledAddressesXDCv2
+	case rules.IsIstanbul:
+		return PrecompiledAddressesIstanbul
+	case rules.IsByzantium:
+		return PrecompiledAddressesByzantium
+	default:
+		return PrecompiledAddressesHomestead
+	}
+}
+
+// RunPrecompiledContract runs and evaluates the output of a precompiled contract.
+// It returns
+// - the returned bytes,
+// - the _remaining_ gas,
+// - any error that occurred
+func RunPrecompiledContract(evm *EVM, p PrecompiledContract, input []byte, suppliedGas uint64, logger *tracing.Hooks) (ret []byte, remainingGas uint64, err error) {
+	if evm != nil {
+		if evm.chainConfig.IsTIPXDCXReceiver(evm.Context.BlockNumber) {
+			switch p := p.(type) {
+			case *XDCxEpochPrice:
+				p.SetTradingState(evm.tradingStateDB)
+			case *XDCxLastPrice:
+				p.SetTradingState(evm.tradingStateDB)
+			}
+		}
+	}
+
+	gasCost := p.RequiredGas(input)
+	if suppliedGas < gasCost {
+		return nil, 0, ErrOutOfGas
+	}
+	if logger != nil && logger.OnGasChange != nil {
+		logger.OnGasChange(suppliedGas, suppliedGas-gasCost, tracing.GasChangeCallPrecompiledContract)
+	}
+	suppliedGas -= gasCost
+	output, err := p.Run(input)
+	return output, suppliedGas, err
+}
+
+// ecrecover implemented as a native contract.
+type ecrecover struct{}
+
+func (c *ecrecover) RequiredGas(input []byte) uint64 {
+	return params.EcrecoverGas
+}
+
+func (c *ecrecover) Run(input []byte) ([]byte, error) {
+	const ecRecoverInputLength = 128
+
+	input = common.RightPadBytes(input, ecRecoverInputLength)
+	// "input" is (hash, v, r, s), each 32 bytes
+	// but for ecrecover we want (r, s, v)
+
+	r := new(big.Int).SetBytes(input[64:96])
+	s := new(big.Int).SetBytes(input[96:128])
+	v := input[63] - 27
+
+	// tighter sig s values input homestead only apply to tx sigs
+	if bitutil.TestBytes(input[32:63]) || !crypto.ValidateSignatureValues(v, r, s, false) {
+		return nil, nil
+	}
+	// We must make sure not to modify the 'input', so placing the 'v' along with
+	// the signature needs to be done on a new allocation
+	var sig [crypto.SignatureLength]byte
+	copy(sig[:], input[64:128])
+	sig[64] = v
+	// v needs to be at the end for libsecp256k1
+	pubKey, err := crypto.Ecrecover(input[:32], sig[:])
+	// make sure the public key is a valid one
+	if err != nil {
+		return nil, nil
+	}
+
+	// the first byte of pubkey is bitcoin heritage
+	return common.LeftPadBytes(crypto.Keccak256(pubKey[1:])[12:], 32), nil
+}
+
+func (c *ecrecover) Name() string {
+	return "ECREC"
+}
+
+// SHA256 implemented as a native contract.
+type sha256hash struct{}
+
+// RequiredGas returns the gas required to execute the pre-compiled contract.
+//
+// This method does not require any overflow checking as the input size gas costs
+// required for anything significant is so high it's impossible to pay for.
+func (c *sha256hash) RequiredGas(input []byte) uint64 {
+	return uint64(len(input)+31)/32*params.Sha256PerWordGas + params.Sha256BaseGas
+}
+func (c *sha256hash) Run(input []byte) ([]byte, error) {
+	h := sha256.Sum256(input)
+	return h[:], nil
+}
+
+func (c *sha256hash) Name() string {
+	return "SHA256"
+}
+
+// RIPEMD160 implemented as a native contract.
+type ripemd160hash struct{}
+
+// RequiredGas returns the gas required to execute the pre-compiled contract.
+//
+// This method does not require any overflow checking as the input size gas costs
+// required for anything significant is so high it's impossible to pay for.
+func (c *ripemd160hash) RequiredGas(input []byte) uint64 {
+	return uint64(len(input)+31)/32*params.Ripemd160PerWordGas + params.Ripemd160BaseGas
+}
+func (c *ripemd160hash) Run(input []byte) ([]byte, error) {
+	ripemd := ripemd160.New()
+	ripemd.Write(input)
+	return common.LeftPadBytes(ripemd.Sum(nil), 32), nil
+}
+
+func (c *ripemd160hash) Name() string {
+	return "RIPEMD160"
+}
+
+// data copy implemented as a native contract.
+type dataCopy struct{}
+
+// RequiredGas returns the gas required to execute the pre-compiled contract.
+//
+// This method does not require any overflow checking as the input size gas costs
+// required for anything significant is so high it's impossible to pay for.
+func (c *dataCopy) RequiredGas(input []byte) uint64 {
+	return uint64(len(input)+31)/32*params.IdentityPerWordGas + params.IdentityBaseGas
+}
+func (c *dataCopy) Run(in []byte) ([]byte, error) {
+	return common.CopyBytes(in), nil
+}
+
+func (c *dataCopy) Name() string {
+	return "ID"
+}
+
+// bigModExp implements a native big integer exponential modular operation.
+type bigModExp struct {
+	eip2565 bool
+	eip7823 bool
+	eip7883 bool
+}
+
+var (
+	big0      = big.NewInt(0)
+	big1      = big.NewInt(1)
+	big3      = big.NewInt(3)
+	big7      = big.NewInt(7)
+	big20     = big.NewInt(20)
+	big32     = big.NewInt(32)
+	big64     = big.NewInt(64)
+	big96     = big.NewInt(96)
+	big480    = big.NewInt(480)
+	big1024   = big.NewInt(1024)
+	big3072   = big.NewInt(3072)
+	big199680 = big.NewInt(199680)
+)
+
+// modexpMultComplexity implements bigModexp multComplexity formula, as defined in EIP-198
+//
+// def mult_complexity(x):
+//
+//	if x <= 64: return x ** 2
+//	elif x <= 1024: return x ** 2 // 4 + 96 * x - 3072
+//	else: return x ** 2 // 16 + 480 * x - 199680
+//
+// where is x is max(length_of_MODULUS, length_of_BASE)
+func modexpMultComplexity(x *big.Int) *big.Int {
+	switch {
+	case x.Cmp(big64) <= 0:
+		x.Mul(x, x) // x ** 2
+	case x.Cmp(big1024) <= 0:
+		// (x ** 2 // 4 ) + ( 96 * x - 3072)
+		x = new(big.Int).Add(
+			new(big.Int).Rsh(new(big.Int).Mul(x, x), 2),
+			new(big.Int).Sub(new(big.Int).Mul(big96, x), big3072),
+		)
+	default:
+		// (x ** 2 // 16) + (480 * x - 199680)
+		x = new(big.Int).Add(
+			new(big.Int).Rsh(new(big.Int).Mul(x, x), 4),
+			new(big.Int).Sub(new(big.Int).Mul(big480, x), big199680),
+		)
+	}
+	return x
+}
+
+// RequiredGas returns the gas required to execute the pre-compiled contract.
+func (c *bigModExp) RequiredGas(input []byte) uint64 {
+	var (
+		baseLen = new(big.Int).SetBytes(getData(input, 0, 32))
+		expLen  = new(big.Int).SetBytes(getData(input, 32, 32))
+		modLen  = new(big.Int).SetBytes(getData(input, 64, 32))
+	)
+	if len(input) > 96 {
+		input = input[96:]
+	} else {
+		input = input[:0]
+	}
+	// Retrieve the head 32 bytes of exp for the adjusted exponent length
+	var expHead *big.Int
+	if big.NewInt(int64(len(input))).Cmp(baseLen) <= 0 {
+		expHead = new(big.Int)
+	} else {
+		if expLen.Cmp(big32) > 0 {
+			expHead = new(big.Int).SetBytes(getData(input, baseLen.Uint64(), 32))
+		} else {
+			expHead = new(big.Int).SetBytes(getData(input, baseLen.Uint64(), expLen.Uint64()))
+		}
+	}
+	// Calculate the adjusted exponent length
+	var msb int
+	if bitlen := expHead.BitLen(); bitlen > 0 {
+		msb = bitlen - 1
+	}
+	adjExpLen := new(big.Int)
+	if expLen.Cmp(big32) > 0 {
+		adjExpLen.Sub(expLen, big32)
+		if c.eip7883 {
+			adjExpLen.Lsh(adjExpLen, 4)
+		} else {
+			adjExpLen.Lsh(adjExpLen, 3)
+		}
+	}
+	adjExpLen.Add(adjExpLen, big.NewInt(int64(msb)))
+	// Calculate the gas cost of the operation
+	gas := new(big.Int)
+	if modLen.Cmp(baseLen) < 0 {
+		gas.Set(baseLen)
+	} else {
+		gas.Set(modLen)
+	}
+
+	maxLenOver32 := gas.Cmp(big32) > 0
+	if c.eip2565 {
+		// EIP-2565 has three changes
+		// 1. Different multComplexity (inlined here)
+		// in EIP-2565 (https://eips.ethereum.org/EIPS/eip-2565):
+		//
+		// def mult_complexity(x):
+		//    ceiling(x/8)^2
+		//
+		// where is x is max(length_of_MODULUS, length_of_BASE)
+		gas.Add(gas, big7)
+		gas.Rsh(gas, 3)
+		gas.Mul(gas, gas)
+
+		var minPrice uint64 = 200
+		if c.eip7883 {
+			minPrice = 500
+			if maxLenOver32 {
+				gas.Add(gas, gas)
+			} else {
+				gas = big.NewInt(16)
+			}
+		}
+
+		if adjExpLen.Cmp(big1) > 0 {
+			gas.Mul(gas, adjExpLen)
+		}
+		// 2. Different divisor (`GQUADDIVISOR`) (3)
+		if !c.eip7883 {
+			gas.Div(gas, big3)
+		}
+		if gas.BitLen() > 64 {
+			return math.MaxUint64
+		}
+		return max(minPrice, gas.Uint64())
+	}
+
+	// Pre-Berlin logic.
+	gas = modexpMultComplexity(gas)
+	if adjExpLen.Cmp(big1) > 0 {
+		gas.Mul(gas, adjExpLen)
+	}
+	gas.Div(gas, big20)
+	if gas.BitLen() > 64 {
+		return math.MaxUint64
+	}
+	return gas.Uint64()
+}
+
+func (c *bigModExp) Run(input []byte) ([]byte, error) {
+	var (
+		baseLenBig       = new(big.Int).SetBytes(getData(input, 0, 32))
+		expLenBig        = new(big.Int).SetBytes(getData(input, 32, 32))
+		modLenBig        = new(big.Int).SetBytes(getData(input, 64, 32))
+		baseLen          = baseLenBig.Uint64()
+		expLen           = expLenBig.Uint64()
+		modLen           = modLenBig.Uint64()
+		inputLenOverflow = max(baseLenBig.BitLen(), expLenBig.BitLen(), modLenBig.BitLen()) > 64
+	)
+	if len(input) > 96 {
+		input = input[96:]
+	} else {
+		input = input[:0]
+	}
+
+	// enforce size cap for inputs
+	if c.eip7823 && (inputLenOverflow || max(baseLen, expLen, modLen) > 1024) {
+		return nil, errors.New("one or more of base/exponent/modulus length exceeded 1024 bytes")
+	}
+	// Handle a special case when both the base and mod length is zero
+	if baseLen == 0 && modLen == 0 {
+		return []byte{}, nil
+	}
+	// Retrieve the operands and execute the exponentiation
+	var (
+		base = new(patched_big.Int).SetBytes(getData(input, 0, baseLen))
+		exp  = new(patched_big.Int).SetBytes(getData(input, baseLen, expLen))
+		mod  = new(patched_big.Int).SetBytes(getData(input, baseLen+expLen, modLen))
+		v    []byte
+	)
+	switch {
+	case mod.BitLen() == 0:
+		// Modulo 0 is undefined, return zero
+		return common.LeftPadBytes([]byte{}, int(modLen)), nil
+	case base.BitLen() == 1: // a bit length of 1 means it's 1 (or -1).
+		// If base == 1, then we can just return base % mod (if mod >= 1, which it is)
+		v = base.Mod(base, mod).Bytes()
+	default:
+		v = base.Exp(base, exp, mod).Bytes()
+	}
+	return common.LeftPadBytes(v, int(modLen)), nil
+}
+
+func (c *bigModExp) Name() string {
+	return "MODEXP"
+}
+
+// newCurvePoint unmarshals a binary blob into a bn256 elliptic curve point,
+// returning it, or an error if the point is invalid.
+func newCurvePoint(blob []byte) (*bn256.G1, error) {
+	p := new(bn256.G1)
+	if _, err := p.Unmarshal(blob); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// newTwistPoint unmarshals a binary blob into a bn256 elliptic curve point,
+// returning it, or an error if the point is invalid.
+func newTwistPoint(blob []byte) (*bn256.G2, error) {
+	p := new(bn256.G2)
+	if _, err := p.Unmarshal(blob); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// runBn256Add implements the Bn256Add precompile, referenced by both
+// Byzantium and Istanbul operations.
+func runBn256Add(input []byte) ([]byte, error) {
+	x, err := newCurvePoint(getData(input, 0, 64))
+	if err != nil {
+		return nil, err
+	}
+	y, err := newCurvePoint(getData(input, 64, 64))
+	if err != nil {
+		return nil, err
+	}
+	res := new(bn256.G1)
+	res.Add(x, y)
+	return res.Marshal(), nil
+}
+
+// Fork-specific bn256 precompiles intentionally share the same operation names.
+// The active implementation is still selected by address from the fork-specific
+// precompile map, so identical Name values across hard forks are expected.
+
+// bn256AddIstanbul implements a native elliptic curve point addition conforming to
+// Istanbul consensus rules.
+type bn256AddIstanbul struct{}
+
+// RequiredGas returns the gas required to execute the pre-compiled contract.
+func (c *bn256AddIstanbul) RequiredGas(input []byte) uint64 {
+	return params.Bn256AddGasIstanbul
+}
+
+func (c *bn256AddIstanbul) Run(input []byte) ([]byte, error) {
+	return runBn256Add(input)
+}
+
+func (c *bn256AddIstanbul) Name() string {
+	return "BN256_ADD"
+}
+
+// bn256AddByzantium implements a native elliptic curve point addition
+// conforming to Byzantium consensus rules.
+type bn256AddByzantium struct{}
+
+// RequiredGas returns the gas required to execute the pre-compiled contract.
+func (c *bn256AddByzantium) RequiredGas(input []byte) uint64 {
+	return params.Bn256AddGasByzantium
+}
+
+func (c *bn256AddByzantium) Run(input []byte) ([]byte, error) {
+	return runBn256Add(input)
+}
+
+func (c *bn256AddByzantium) Name() string {
+	return "BN256_ADD"
+}
+
+// runBn256ScalarMul implements the Bn256ScalarMul precompile, referenced by
+// both Byzantium and Istanbul operations.
+func runBn256ScalarMul(input []byte) ([]byte, error) {
+	p, err := newCurvePoint(getData(input, 0, 64))
+	if err != nil {
+		return nil, err
+	}
+	res := new(bn256.G1)
+	res.ScalarMult(p, new(big.Int).SetBytes(getData(input, 64, 32)))
+	return res.Marshal(), nil
+}
+
+// bn256ScalarMulIstanbul implements a native elliptic curve scalar
+// multiplication conforming to Istanbul consensus rules.
+type bn256ScalarMulIstanbul struct{}
+
+// RequiredGas returns the gas required to execute the pre-compiled contract.
+func (c *bn256ScalarMulIstanbul) RequiredGas(input []byte) uint64 {
+	return params.Bn256ScalarMulGasIstanbul
+}
+
+func (c *bn256ScalarMulIstanbul) Run(input []byte) ([]byte, error) {
+	return runBn256ScalarMul(input)
+}
+
+func (c *bn256ScalarMulIstanbul) Name() string {
+	return "BN256_MUL"
+}
+
+// bn256ScalarMulByzantium implements a native elliptic curve scalar
+// multiplication conforming to Byzantium consensus rules.
+type bn256ScalarMulByzantium struct{}
+
+// RequiredGas returns the gas required to execute the pre-compiled contract.
+func (c *bn256ScalarMulByzantium) RequiredGas(input []byte) uint64 {
+	return params.Bn256ScalarMulGasByzantium
+}
+
+func (c *bn256ScalarMulByzantium) Run(input []byte) ([]byte, error) {
+	return runBn256ScalarMul(input)
+}
+
+func (c *bn256ScalarMulByzantium) Name() string {
+	return "BN256_MUL"
+}
+
+var (
+	// true32Byte is returned if the bn256 pairing check succeeds.
+	true32Byte = []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
+
+	// false32Byte is returned if the bn256 pairing check fails.
+	false32Byte = make([]byte, 32)
+
+	// errBadPairingInput is returned if the bn256 pairing input is invalid.
+	errBadPairingInput = errors.New("bad elliptic curve pairing size")
+)
+
+// runBn256Pairing implements the Bn256Pairing precompile, referenced by both
+// Byzantium and Istanbul operations.
+func runBn256Pairing(input []byte) ([]byte, error) {
+	// Handle some corner cases cheaply
+	if len(input)%192 > 0 {
+		return nil, errBadPairingInput
+	}
+	// Convert the input into a set of coordinates
+	var (
+		cs []*bn256.G1
+		ts []*bn256.G2
+	)
+	for i := 0; i < len(input); i += 192 {
+		c, err := newCurvePoint(input[i : i+64])
+		if err != nil {
+			return nil, err
+		}
+		t, err := newTwistPoint(input[i+64 : i+192])
+		if err != nil {
+			return nil, err
+		}
+		cs = append(cs, c)
+		ts = append(ts, t)
+	}
+	// Execute the pairing checks and return the results
+	if bn256.PairingCheck(cs, ts) {
+		return true32Byte, nil
+	}
+	return false32Byte, nil
+}
+
+// P256VERIFY (secp256r1 signature verification)
+// implemented as a native contract
+type p256Verify struct{}
+
+// RequiredGas returns the gas required to execute the precompiled contract
+func (c *p256Verify) RequiredGas(input []byte) uint64 {
+	return params.P256VerifyGas
+}
+
+// p256VerifyInputLength is the only input length p256Verify accepts.
+const p256VerifyInputLength = 160
+
+// Run executes the precompiled contract with given 160 bytes of param, returning the output and the used gas
+func (c *p256Verify) Run(input []byte) ([]byte, error) {
+	if len(input) != p256VerifyInputLength {
+		return nil, nil
+	}
+
+	// Extract hash, r, s, x, y from the input.
+	hash := input[0:32]
+	r, s := new(big.Int).SetBytes(input[32:64]), new(big.Int).SetBytes(input[64:96])
+	x, y := new(big.Int).SetBytes(input[96:128]), new(big.Int).SetBytes(input[128:160])
+
+	// Verify the signature.
+	if secp256r1.Verify(hash, r, s, x, y) {
+		return true32Byte, nil
+	}
+	return nil, nil
+}
+
+func (c *p256Verify) Name() string {
+	return "P256VERIFY"
+}
+
+type ringSignatureVerifier struct{}
+
+func (c *ringSignatureVerifier) RequiredGas(input []byte) uint64 {
+	// Ring signature verification currently uses a fixed gas charge.
+	return 100000
+}
+
+func (c *ringSignatureVerifier) Run(proof []byte) ([]byte, error) {
+	der, err := privacy.Deserialize(proof)
+	if err != nil {
+		return []byte{}, errors.New("fail to deserialize proof")
+	}
+	if !privacy.Verify(der, false) {
+		return []byte{}, errors.New("fail to verify ring signature")
+	}
+	return []byte{}, nil
+}
+
+func (c *ringSignatureVerifier) Name() string {
+	return "RING_SIG_VERIFY"
+}
+
+type bulletproofVerifier struct{}
+
+func (c *bulletproofVerifier) RequiredGas(input []byte) uint64 {
+	// Bulletproof verification currently uses a fixed gas charge.
+	return 100000
+}
+
+func (c *bulletproofVerifier) Name() string {
+	return "BULLET_PROOF_VERIFY"
+}
+
+func (c *bulletproofVerifier) Run(proof []byte) ([]byte, error) {
+	mrp := new(privacy.MultiRangeProof)
+	if mrp.Deserialize(proof) != nil {
+		return []byte{}, errors.New("failed to deserialize bulletproofs")
+	}
+
+	if !privacy.MRPVerify(mrp) {
+		return []byte{}, errors.New("failed to verify bulletproof")
+	}
+	return []byte{}, nil
+}
+
+// bn256PairingIstanbul implements a pairing pre-compile for the bn256 curve
+// conforming to Istanbul consensus rules.
+type bn256PairingIstanbul struct{}
+
+// RequiredGas returns the gas required to execute the pre-compiled contract.
+func (c *bn256PairingIstanbul) RequiredGas(input []byte) uint64 {
+	return params.Bn256PairingBaseGasIstanbul + uint64(len(input)/192)*params.Bn256PairingPerPointGasIstanbul
+}
+
+func (c *bn256PairingIstanbul) Run(input []byte) ([]byte, error) {
+	return runBn256Pairing(input)
+}
+
+func (c *bn256PairingIstanbul) Name() string {
+	return "BN256_PAIRING"
+}
+
+// bn256PairingByzantium implements a pairing pre-compile for the bn256 curve
+// conforming to Byzantium consensus rules.
+type bn256PairingByzantium struct{}
+
+// RequiredGas returns the gas required to execute the pre-compiled contract.
+func (c *bn256PairingByzantium) RequiredGas(input []byte) uint64 {
+	return params.Bn256PairingBaseGasByzantium + uint64(len(input)/192)*params.Bn256PairingPerPointGasByzantium
+}
+
+func (c *bn256PairingByzantium) Run(input []byte) ([]byte, error) {
+	return runBn256Pairing(input)
+}
+
+func (c *bn256PairingByzantium) Name() string {
+	return "BN256_PAIRING"
+}
+
+type blake2F struct{}
+
+func (c *blake2F) RequiredGas(input []byte) uint64 {
+	// If the input is malformed, we can't calculate the gas, return 0 and let the
+	// actual call choke and fault.
+	if len(input) != blake2FInputLength {
+		return 0
+	}
+	return uint64(binary.BigEndian.Uint32(input[0:4]))
+}
+
+func (c *blake2F) Name() string {
+	return "BLAKE2F"
+}
+
+const (
+	blake2FInputLength        = 213
+	blake2FFinalBlockBytes    = byte(1)
+	blake2FNonFinalBlockBytes = byte(0)
+)
+
+var (
+	errBlake2FInvalidInputLength = errors.New("invalid input length")
+	errBlake2FInvalidFinalFlag   = errors.New("invalid final flag")
+)
+
+func (c *blake2F) Run(input []byte) ([]byte, error) {
+	// Make sure the input is valid (correct length and final flag)
+	if len(input) != blake2FInputLength {
+		return nil, errBlake2FInvalidInputLength
+	}
+	if input[212] != blake2FNonFinalBlockBytes && input[212] != blake2FFinalBlockBytes {
+		return nil, errBlake2FInvalidFinalFlag
+	}
+	// Parse the input into the Blake2b call parameters
+	var (
+		rounds = binary.BigEndian.Uint32(input[0:4])
+		final  = input[212] == blake2FFinalBlockBytes
+
+		h [8]uint64
+		m [16]uint64
+		t [2]uint64
+	)
+	for i := 0; i < 8; i++ {
+		offset := 4 + i*8
+		h[i] = binary.LittleEndian.Uint64(input[offset : offset+8])
+	}
+	for i := 0; i < 16; i++ {
+		offset := 68 + i*8
+		m[i] = binary.LittleEndian.Uint64(input[offset : offset+8])
+	}
+	t[0] = binary.LittleEndian.Uint64(input[196:204])
+	t[1] = binary.LittleEndian.Uint64(input[204:212])
+
+	// Execute the compression function, extract and return the result
+	blake2b.F(&h, m, t, final, rounds)
+
+	output := make([]byte, 64)
+	for i := 0; i < 8; i++ {
+		offset := i * 8
+		binary.LittleEndian.PutUint64(output[offset:offset+8], h[i])
+	}
+	return output, nil
+}
+
+// errKZGUnsupported is returned by the 0x0a placeholder. It has no upstream
+// counterpart: geth implements the point evaluation precompile, while XDC
+// deliberately does not.
+var errKZGUnsupported = errors.New("kzg point evaluation precompile is not supported")
+
+// unsupportedPrecompile occupies a precompile address whose implementation is
+// intentionally absent, so that calls fail loudly instead of silently
+// succeeding as calls to an empty account.
+//
+// name must be the name geth reports for the same address: XDPoS_getConfig
+// reports the active precompiles by name (params/chainconfigview), while the
+// tracers classify them by address. gas must be the upstream gas cost so that
+// gas accounting stays comparable.
+type unsupportedPrecompile struct {
+	name string
+	gas  uint64
+	err  error
+}
+
+// kzgStub occupies 0x0a in the Prague and Osaka buckets. It is not a KZG
+// implementation: every input, including a well-formed 192-byte proof, fails.
+var kzgStub = &unsupportedPrecompile{
+	name: "KZG_POINT_EVALUATION",
+	gas:  params.BlobTxPointEvaluationPrecompileGas,
+	err:  errKZGUnsupported,
+}
+
+// RequiredGas reports the upstream gas cost for the occupied address.
+func (c *unsupportedPrecompile) RequiredGas(input []byte) uint64 { return c.gas }
+
+// Run always fails. Returning a plain error (rather than ErrExecutionReverted)
+// makes evm.Call consume all the gas handed to this frame.
+func (c *unsupportedPrecompile) Run(input []byte) ([]byte, error) { return nil, c.err }
+
+func (c *unsupportedPrecompile) Name() string { return c.name }

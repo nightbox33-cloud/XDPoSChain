@@ -1,0 +1,280 @@
+// Copyright 2015 The go-ethereum Authors
+// This file is part of the go-ethereum library.
+//
+// The go-ethereum library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The go-ethereum library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+
+package core
+
+import (
+	"errors"
+	"fmt"
+	"math/big"
+	"strings"
+	"testing"
+
+	"github.com/XinFinOrg/XDPoSChain/common"
+	"github.com/XinFinOrg/XDPoSChain/consensus"
+	"github.com/XinFinOrg/XDPoSChain/consensus/ethash"
+	"github.com/XinFinOrg/XDPoSChain/core/rawdb"
+	"github.com/XinFinOrg/XDPoSChain/core/state"
+	"github.com/XinFinOrg/XDPoSChain/core/types"
+	"github.com/XinFinOrg/XDPoSChain/core/vm"
+	"github.com/XinFinOrg/XDPoSChain/crypto"
+	"github.com/XinFinOrg/XDPoSChain/params"
+)
+
+// failingFinalizeEngine is a consensus engine whose Finalize always fails. It
+// embeds the noop engine of the package so that only the Finalize path under
+// test needs to be overridden.
+type failingFinalizeEngine struct {
+	noopConsensusEngine
+}
+
+func (failingFinalizeEngine) Finalize(chain consensus.ChainReader, header *types.Header, state vm.StateDB, parentState *state.StateDB, txs []*types.Transaction, uncles []*types.Header, receipts []*types.Receipt) (*types.Block, error) {
+	return nil, errors.New("finalize failed")
+}
+
+// capturingParentStateEngine records the snapshot GenerateChain hands to
+// Finalize, so a test can assert what the reward path sees. It touches nothing
+// itself.
+type capturingParentStateEngine struct {
+	noopConsensusEngine
+	watched             common.Address
+	called              bool
+	parentBalance       *big.Int
+	parentHasMulticall3 bool
+	stateHasMulticall3  bool
+}
+
+func (e *capturingParentStateEngine) Finalize(chain consensus.ChainReader, header *types.Header, state vm.StateDB, parentState *state.StateDB, txs []*types.Transaction, uncles []*types.Header, receipts []*types.Receipt) (*types.Block, error) {
+	e.called = true
+	e.parentBalance = new(big.Int).Set(parentState.GetBalance(e.watched))
+	e.parentHasMulticall3 = len(parentState.GetCode(params.Multicall3Address)) > 0
+	e.stateHasMulticall3 = len(state.GetCode(params.Multicall3Address)) > 0
+	return types.NewBlockWithHeader(header).WithBody(types.Body{Transactions: txs, Uncles: uncles}), nil
+}
+
+// TestGenerateChainSnapshotsParentStateBeforeTransactions pins the snapshot a
+// generated block hands to Finalize: Process and the miner take it before the
+// transactions, while GenerateChain used to copy the post-transaction state
+// inside the Finalize call.
+func TestGenerateChainSnapshotsParentStateBeforeTransactions(t *testing.T) {
+	var (
+		key, _  = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+		addr    = crypto.PubkeyToAddress(key.PublicKey)
+		watched = common.HexToAddress("0x00000000000000000000000000000000000000bb")
+		db      = rawdb.NewMemoryDatabase()
+	)
+	gspec := &Genesis{
+		Config: &params.ChainConfig{
+			ChainID:        big.NewInt(1337),
+			HomesteadBlock: new(big.Int),
+			Ethash:         new(params.EthashConfig),
+		},
+		Alloc: types.GenesisAlloc{addr: {Balance: big.NewInt(1000000)}},
+	}
+	genesis := gspec.MustCommit(db)
+
+	engine := &capturingParentStateEngine{watched: watched}
+	GenerateChain(gspec.Config, genesis, engine, db, 1, func(i int, gen *BlockGen) {
+		tx, err := types.SignTx(types.NewTransaction(gen.TxNonce(addr), watched, big.NewInt(1), params.TxGas, nil, nil), types.HomesteadSigner{}, key)
+		if err != nil {
+			t.Fatalf("failed to sign transaction: %v", err)
+		}
+		gen.AddTx(tx)
+	})
+	if !engine.called {
+		t.Fatal("engine Finalize was not called")
+	}
+	if have := engine.parentBalance; have.Sign() != 0 {
+		t.Fatalf("the parent snapshot already carries the block's transfer: balance %v", have)
+	}
+}
+
+// TestGenerateChainSnapshotsParentStateBeforeBlockLevelHooks pins the ordering:
+// Finalize's parentState predates the block level hooks, as in Process and
+// ProcessBlockNoValidator.
+func TestGenerateChainSnapshotsParentStateBeforeBlockLevelHooks(t *testing.T) {
+	db := rawdb.NewMemoryDatabase()
+	// Prague at block 1 makes the Multicall3 install the observable hook: the
+	// snapshot has to miss it while the processed state carries it.
+	gspec := &Genesis{Config: multicall3Config(big.NewInt(1))}
+	genesis := gspec.MustCommit(db)
+
+	engine := &capturingParentStateEngine{}
+	GenerateChain(gspec.Config, genesis, engine, db, 1, nil)
+	if !engine.called {
+		t.Fatal("engine Finalize was not called")
+	}
+	if engine.parentHasMulticall3 {
+		t.Fatal("the parent snapshot was taken after the block level hooks: Multicall3 already installed")
+	}
+	if !engine.stateHasMulticall3 {
+		t.Fatal("the block level hooks did not run: Multicall3 not installed")
+	}
+}
+
+// TestGenerateChainAddTxWithoutTRC21Issuer tests generate chain add tx without trc 21 issuer.
+func TestGenerateChainAddTxWithoutTRC21Issuer(t *testing.T) {
+	var (
+		key1, _ = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+		addr1   = crypto.PubkeyToAddress(key1.PublicKey)
+		addr2   = common.HexToAddress("0x00000000000000000000000000000000000000aa")
+		db      = rawdb.NewMemoryDatabase()
+	)
+	gspec := &Genesis{
+		Config: &params.ChainConfig{
+			ChainID:        big.NewInt(1337),
+			HomesteadBlock: new(big.Int),
+			Ethash:         new(params.EthashConfig),
+		},
+		Alloc: types.GenesisAlloc{addr1: {Balance: big.NewInt(1000000)}},
+	}
+	if !gspec.Config.TRC21IssuerSMC.IsZero() {
+		t.Fatal("expected TRC21 issuer to remain unset for this regression test")
+	}
+	genesis := gspec.MustCommit(db)
+
+	signer := types.HomesteadSigner{}
+	chain, _ := GenerateChain(gspec.Config, genesis, ethash.NewFaker(), db, 1, func(i int, gen *BlockGen) {
+		tx, err := types.SignTx(types.NewTransaction(gen.TxNonce(addr1), addr2, big.NewInt(1), params.TxGas, nil, nil), signer, key1)
+		if err != nil {
+			t.Fatalf("failed to sign transaction: %v", err)
+		}
+		gen.AddTx(tx)
+	})
+
+	if len(chain) != 1 {
+		t.Fatalf("unexpected chain length %d", len(chain))
+	}
+	if got := chain[0].Transactions().Len(); got != 1 {
+		t.Fatalf("unexpected tx count %d", got)
+	}
+}
+
+// TestGenerateChainFinalizeError tests that GenerateChain surfaces a failing
+// Finalize of the consensus engine instead of discarding the error and
+// committing the state anyway.
+func TestGenerateChainFinalizeError(t *testing.T) {
+	db := rawdb.NewMemoryDatabase()
+	gspec := &Genesis{
+		Config: &params.ChainConfig{
+			ChainID:        big.NewInt(1337),
+			HomesteadBlock: new(big.Int),
+			Ethash:         new(params.EthashConfig),
+		},
+	}
+	genesis := gspec.MustCommit(db)
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected GenerateChain to panic when Finalize fails")
+		}
+		msg, ok := r.(string)
+		if !ok || !strings.Contains(msg, "finalize error") || !strings.Contains(msg, "finalize failed") {
+			t.Fatalf("unexpected panic value: %v", r)
+		}
+	}()
+	GenerateChain(gspec.Config, genesis, failingFinalizeEngine{}, db, 1, nil)
+}
+
+func ExampleGenerateChain() {
+	var (
+		key1, _ = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+		key2, _ = crypto.HexToECDSA("8a1f9a8f95be41cd7ccb6168179afb4504aefe388d1e14474d32c45c72ce7b7a")
+		key3, _ = crypto.HexToECDSA("49a7b37aa6f6645917e7b807e9d1c00d4fa71f18343b0d4122a4d2df64dd6fee")
+		addr1   = crypto.PubkeyToAddress(key1.PublicKey)
+		addr2   = crypto.PubkeyToAddress(key2.PublicKey)
+		addr3   = crypto.PubkeyToAddress(key3.PublicKey)
+		db      = rawdb.NewMemoryDatabase()
+	)
+	// Ensure that key1 has some funds in the genesis block.
+	futureFork := big.NewInt(1_000_000_000)
+	gspec := &Genesis{
+		Config: &params.ChainConfig{
+			ChainID:                big.NewInt(1337),
+			HomesteadBlock:         new(big.Int),
+			EIP150Block:            new(big.Int).Set(futureFork),
+			EIP155Block:            new(big.Int).Set(futureFork),
+			EIP158Block:            new(big.Int).Set(futureFork),
+			ByzantiumBlock:         new(big.Int).Set(futureFork),
+			TRC21IssuerSMC:         params.TestnetChainConfig.TRC21IssuerSMC,
+			XDCXListingSMC:         params.TestnetChainConfig.XDCXListingSMC,
+			RelayerRegistrationSMC: params.TestnetChainConfig.RelayerRegistrationSMC,
+			LendingRegistrationSMC: params.TestnetChainConfig.LendingRegistrationSMC,
+			Ethash:                 new(params.EthashConfig),
+		},
+		Alloc: types.GenesisAlloc{addr1: {Balance: big.NewInt(1000000)}},
+	}
+	setXinFinForksToFuture(gspec.Config, futureFork)
+	config, err := resolveProvidedChainConfig(common.Hash{}, gspec.Config, builtInChainConfigMustMatch)
+	if err != nil {
+		panic(err)
+	}
+	gspec.Config = config
+	genesis := gspec.MustCommit(db)
+
+	// This call generates a chain of 5 blocks. The function runs for
+	// each block and adds different features to gen based on the
+	// block index.
+	signer := types.HomesteadSigner{}
+	chain, _ := GenerateChain(gspec.Config, genesis, ethash.NewFaker(), db, 5, func(i int, gen *BlockGen) {
+		switch i {
+		case 0:
+			// In block 1, addr1 sends addr2 some ether.
+			tx, _ := types.SignTx(types.NewTransaction(gen.TxNonce(addr1), addr2, big.NewInt(10000), params.TxGas, nil, nil), signer, key1)
+			gen.AddTx(tx)
+		case 1:
+			// In block 2, addr1 sends some more ether to addr2.
+			// addr2 passes it on to addr3.
+			tx1, _ := types.SignTx(types.NewTransaction(gen.TxNonce(addr1), addr2, big.NewInt(1000), params.TxGas, nil, nil), signer, key1)
+			tx2, _ := types.SignTx(types.NewTransaction(gen.TxNonce(addr2), addr3, big.NewInt(1000), params.TxGas, nil, nil), signer, key2)
+			gen.AddTx(tx1)
+			gen.AddTx(tx2)
+		case 2:
+			// Block 3 is empty but was mined by addr3.
+			gen.SetCoinbase(addr3)
+			gen.SetExtra([]byte("yeehaw"))
+		case 3:
+			// Block 4 includes blocks 2 and 3 as uncle headers (with modified extra data).
+			b2 := gen.PrevBlock(1).Header()
+			b2.Extra = []byte("foo")
+			gen.AddUncle(b2)
+			b3 := gen.PrevBlock(2).Header()
+			b3.Extra = []byte("foo")
+			gen.AddUncle(b3)
+		}
+	})
+
+	// Import the chain. This runs all block validation rules.
+	blockchain, _ := NewBlockChain(db, nil, gspec, ethash.NewFaker(), vm.Config{})
+	defer blockchain.Stop()
+
+	if i, err := blockchain.InsertChain(chain); err != nil {
+		fmt.Printf("insert error (block %d): %v\n", chain[i].NumberU64(), err)
+		return
+	}
+
+	state, _ := blockchain.State()
+	fmt.Printf("last block: #%d\n", blockchain.CurrentBlock().Number)
+	fmt.Println("balance of addr1:", state.GetBalance(addr1))
+	fmt.Println("balance of addr2:", state.GetBalance(addr2))
+	fmt.Println("balance of addr3:", state.GetBalance(addr3))
+	// Output:
+	// last block: #5
+	// balance of addr1: 989000
+	// balance of addr2: 10000
+	// balance of addr3: 19687500000000001000
+}

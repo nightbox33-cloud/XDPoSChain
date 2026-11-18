@@ -1,0 +1,255 @@
+// Copyright 2017 The go-ethereum Authors
+// This file is part of the go-ethereum library.
+//
+// The go-ethereum library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The go-ethereum library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+
+package vm
+
+import (
+	"bytes"
+	"errors"
+	"math"
+	"math/big"
+	"sort"
+	"testing"
+
+	"github.com/XinFinOrg/XDPoSChain/common"
+	"github.com/XinFinOrg/XDPoSChain/common/hexutil"
+	"github.com/XinFinOrg/XDPoSChain/core/rawdb"
+	"github.com/XinFinOrg/XDPoSChain/core/state"
+	"github.com/XinFinOrg/XDPoSChain/core/types"
+	"github.com/XinFinOrg/XDPoSChain/params"
+	"github.com/holiman/uint256"
+)
+
+// TestMemoryGasCost tests memory gas cost.
+func TestMemoryGasCost(t *testing.T) {
+	tests := []struct {
+		size     uint64
+		cost     uint64
+		overflow bool
+	}{
+		{0x1fffffffe0, 36028809887088637, false},
+		{0x1fffffffe1, 0, true},
+	}
+	for i, tt := range tests {
+		v, err := memoryGasCost(&Memory{}, tt.size)
+		if (err == ErrGasUintOverflow) != tt.overflow {
+			t.Errorf("test %d: overflow mismatch: have %v, want %v", i, err == ErrGasUintOverflow, tt.overflow)
+		}
+		if v != tt.cost {
+			t.Errorf("test %d: gas cost mismatch: have %v, want %v", i, v, tt.cost)
+		}
+	}
+}
+
+var eip2200Tests = []struct {
+	original byte
+	gaspool  uint64
+	input    string
+	used     uint64
+	refund   uint64
+	failure  error
+}{
+	{0, math.MaxUint64, "0x60006000556000600055", 1612, 0, nil},                // 0 -> 0 -> 0
+	{0, math.MaxUint64, "0x60006000556001600055", 20812, 0, nil},               // 0 -> 0 -> 1
+	{0, math.MaxUint64, "0x60016000556000600055", 20812, 19200, nil},           // 0 -> 1 -> 0
+	{0, math.MaxUint64, "0x60016000556002600055", 20812, 0, nil},               // 0 -> 1 -> 2
+	{0, math.MaxUint64, "0x60016000556001600055", 20812, 0, nil},               // 0 -> 1 -> 1
+	{1, math.MaxUint64, "0x60006000556000600055", 5812, 15000, nil},            // 1 -> 0 -> 0
+	{1, math.MaxUint64, "0x60006000556001600055", 5812, 4200, nil},             // 1 -> 0 -> 1
+	{1, math.MaxUint64, "0x60006000556002600055", 5812, 0, nil},                // 1 -> 0 -> 2
+	{1, math.MaxUint64, "0x60026000556000600055", 5812, 15000, nil},            // 1 -> 2 -> 0
+	{1, math.MaxUint64, "0x60026000556003600055", 5812, 0, nil},                // 1 -> 2 -> 3
+	{1, math.MaxUint64, "0x60026000556001600055", 5812, 4200, nil},             // 1 -> 2 -> 1
+	{1, math.MaxUint64, "0x60026000556002600055", 5812, 0, nil},                // 1 -> 2 -> 2
+	{1, math.MaxUint64, "0x60016000556000600055", 5812, 15000, nil},            // 1 -> 1 -> 0
+	{1, math.MaxUint64, "0x60016000556002600055", 5812, 0, nil},                // 1 -> 1 -> 2
+	{1, math.MaxUint64, "0x60016000556001600055", 1612, 0, nil},                // 1 -> 1 -> 1
+	{0, math.MaxUint64, "0x600160005560006000556001600055", 40818, 19200, nil}, // 0 -> 1 -> 0 -> 1
+	{1, math.MaxUint64, "0x600060005560016000556000600055", 10818, 19200, nil}, // 1 -> 0 -> 1 -> 0
+	{1, 2306, "0x6001600055", 2306, 0, ErrOutOfGas},                            // 1 -> 1 (2300 sentry + 2xPUSH)
+	{1, 2307, "0x6001600055", 806, 0, nil},                                     // 1 -> 1 (2301 sentry + 2xPUSH)
+}
+
+// TestEIP2200 tests eip 2200.
+func TestEIP2200(t *testing.T) {
+	for i, tt := range eip2200Tests {
+		address := common.BytesToAddress([]byte("contract"))
+		db := rawdb.NewMemoryDatabase()
+		statedb, _ := state.New(types.EmptyRootHash, state.NewDatabase(db))
+		statedb.CreateAccount(address)
+		statedb.SetCode(address, hexutil.MustDecode(tt.input))
+		statedb.SetState(address, common.Hash{}, common.BytesToHash([]byte{tt.original}))
+		statedb.Finalise(true) // Push the state into the "original" slot
+
+		vmctx := BlockContext{
+			CanTransfer: func(StateDB, common.Address, *uint256.Int) bool { return true },
+			Transfer:    func(StateDB, common.Address, common.Address, *uint256.Int) {},
+		}
+		evm := NewEVM(vmctx, statedb, nil, params.AllEthashProtocolChanges, Config{ExtraEips: []int{2200}})
+
+		_, gas, err := evm.Call(common.Address{}, address, nil, tt.gaspool, new(uint256.Int))
+		if !errors.Is(err, tt.failure) {
+			t.Errorf("test %d: failure mismatch: have %v, want %v", i, err, tt.failure)
+		}
+		if used := tt.gaspool - gas; used != tt.used {
+			t.Errorf("test %d: gas used mismatch: have %v, want %v", i, used, tt.used)
+		}
+		if refund := evm.StateDB.GetRefund(); refund != tt.refund {
+			t.Errorf("test %d: gas refund mismatch: have %v, want %v", i, refund, tt.refund)
+		}
+	}
+}
+
+type countingStateDB struct {
+	*state.StateDB
+	getStateCalls          int
+	getCommittedStateCalls int
+	getCombinedStateCalls  int
+}
+
+func (s *countingStateDB) GetState(addr common.Address, key common.Hash) common.Hash {
+	s.getStateCalls++
+	return s.StateDB.GetState(addr, key)
+}
+
+func (s *countingStateDB) GetCommittedState(addr common.Address, key common.Hash) common.Hash {
+	s.getCommittedStateCalls++
+	return s.StateDB.GetCommittedState(addr, key)
+}
+
+func (s *countingStateDB) GetStateAndCommittedState(addr common.Address, key common.Hash) (common.Hash, common.Hash) {
+	s.getCombinedStateCalls++
+	return s.StateDB.GetStateAndCommittedState(addr, key)
+}
+
+// TestEIP2200UsesCombinedStateGetter tests eip 2200 uses combined state getter.
+func TestEIP2200UsesCombinedStateGetter(t *testing.T) {
+	address := common.BytesToAddress([]byte("contract"))
+	statedb, _ := state.New(types.EmptyRootHash, state.NewDatabase(rawdb.NewMemoryDatabase()))
+	statedb.CreateAccount(address)
+	statedb.SetCode(address, hexutil.MustDecode("0x6002600055"))
+	statedb.SetState(address, common.Hash{}, common.BytesToHash([]byte{1}))
+	statedb.Finalise(true)
+
+	countingDB := &countingStateDB{StateDB: statedb}
+	vmctx := BlockContext{
+		CanTransfer: func(StateDB, common.Address, *uint256.Int) bool { return true },
+		Transfer:    func(StateDB, common.Address, common.Address, *uint256.Int) {},
+	}
+	evm := NewEVM(vmctx, countingDB, nil, params.AllEthashProtocolChanges, Config{ExtraEips: []int{2200}})
+
+	_, _, err := evm.Call(common.Address{}, address, nil, math.MaxUint64, new(uint256.Int))
+	if err != nil {
+		t.Fatalf("call failed: %v", err)
+	}
+	if countingDB.getCombinedStateCalls == 0 {
+		t.Fatalf("expected GetStateAndCommittedState to be used")
+	}
+	if countingDB.getStateCalls != 0 {
+		t.Fatalf("expected GetState to be bypassed, got %d calls", countingDB.getStateCalls)
+	}
+	if countingDB.getCommittedStateCalls != 0 {
+		t.Fatalf("expected GetCommittedState to be bypassed, got %d calls", countingDB.getCommittedStateCalls)
+	}
+}
+
+// createGasSearchCeiling bounds the gas search in TestCreateGas. A case rejected
+// by a size check fails at every gas amount, so the search returns the ceiling.
+// The ceiling must therefore exceed what the creation itself costs, otherwise a
+// creation that runs out of gas is indistinguishable from one rejected by the
+// size check, and the case stops pinning the check.
+const createGasSearchCeiling = 200_000
+
+var createGasTests = []struct {
+	code       string
+	eip3860    bool
+	gasUsed    uint64
+	minimumGas uint64
+}{
+	// legacy create(0, 0, 0xc000) without 3860 used
+	{"0x61C00060006000f0" + "600052" + "60206000F3", false, 41237, 41237},
+	// legacy create(0, 0, 0xc000) _with_ 3860
+	{"0x61C00060006000f0" + "600052" + "60206000F3", true, 44309, 44309},
+	// create2(0, 0, 0xc001, 0) without 3860
+	{"0x600061C00160006000f5" + "600052" + "60206000F3", false, 50471, 50471},
+	// create2(0, 0, 0x20001, 0) (too large), with 3860
+	{"0x60006202000160006000f5" + "600052" + "60206000F3", true, 32012, createGasSearchCeiling},
+	// create2(0, 0, 0xc000, 0)
+	// This case is trying to deploy code at (within) the Osaka limit
+	{"0x600061C00060006000f5" + "600052" + "60206000F3", true, 53528, 53528},
+	// create2(0, 0, 0x10001, 0)
+	// This case exceeds the Osaka initcode limit but stays within the Amsterdam one
+	{"0x60006201000160006000f5" + "600052" + "60206000F3", true, 62763, 62763},
+	// create2(0, 0, 0x20001, 0)
+	// This case is trying to deploy code exceeding the Amsterdam limit
+	{"0x60006202000160006000f5" + "600052" + "60206000F3", true, 32024, createGasSearchCeiling}}
+
+// TestCreateGas tests create gas.
+func TestCreateGas(t *testing.T) {
+	for i, tt := range createGasTests {
+		var gasUsed = uint64(0)
+		doCheck := func(testGas int) bool {
+			address := common.BytesToAddress([]byte("contract"))
+			statedb, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+			statedb.CreateAccount(address)
+			statedb.SetCode(address, hexutil.MustDecode(tt.code))
+			statedb.Finalise(true)
+			vmctx := BlockContext{
+				CanTransfer: func(StateDB, common.Address, *uint256.Int) bool { return true },
+				Transfer:    func(StateDB, common.Address, common.Address, *uint256.Int) {},
+				BlockNumber: big.NewInt(0),
+			}
+			config := Config{}
+			legacyConfig := *params.AllEthashProtocolChanges
+			legacyConfig.EIP1559Block = nil
+			legacyConfig.CancunBlock = nil
+			legacyConfig.PragueBlock = nil
+			legacyConfig.OsakaBlock = nil
+			legacyConfig.AmsterdamBlock = nil
+			chainConfig := &legacyConfig
+			if tt.eip3860 {
+				config.ExtraEips = []int{3860}
+				chainConfig = params.MergedTestChainConfig
+			}
+
+			evm := NewEVM(vmctx, statedb, nil, chainConfig, config)
+			var startGas = uint64(testGas)
+			ret, gas, err := evm.Call(common.Address{}, address, nil, startGas, new(uint256.Int))
+			if err != nil {
+				return false
+			}
+			gasUsed = startGas - gas
+			if len(ret) != 32 {
+				t.Fatalf("test %d: expected 32 bytes returned, have %d", i, len(ret))
+			}
+			if bytes.Equal(ret, make([]byte, 32)) {
+				// Failure
+				return false
+			}
+			return true
+		}
+		minGas := sort.Search(createGasSearchCeiling, doCheck)
+		if uint64(minGas) != tt.minimumGas {
+			t.Fatalf("test %d: min gas error, want %d, have %d", i, tt.minimumGas, minGas)
+		}
+		// If the deployment succeeded, we also check the gas used
+		if minGas < createGasSearchCeiling {
+			if gasUsed != tt.gasUsed {
+				t.Errorf("test %d: gas used mismatch: have %v, want %v", i, gasUsed, tt.gasUsed)
+			}
+		}
+	}
+}
